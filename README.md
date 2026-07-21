@@ -1,15 +1,15 @@
 # 3scale Lightspeed Tools
 
-Ferramentas do **OpenShift Lightspeed (OLS)** para diagnóstico do
-**Red Hat 3scale API Management**, compostas por duas imagens publicáveis no
+**OpenShift Lightspeed (OLS)** tools for diagnosing
+**Red Hat 3scale API Management**, consisting of two images publishable to
 quay.io:
 
-1. **Servidor MCP em Go** ([mcp-server/](mcp-server/)) — expõe ferramentas
-   *read-only* de troubleshooting do 3scale via Model Context Protocol
-   (transporte streamable HTTP), consumidas pelo OLS através de
+1. **Go MCP server** ([mcp-server/](mcp-server/)) — exposes *read-only*
+   3scale troubleshooting tools via the Model Context Protocol
+   (streamable HTTP transport), consumed by OLS through
    `spec.mcpServers`.
-2. **Imagem BYOK** ([byok/](byok/)) — base de conhecimento RAG (FAISS) com
-   runbooks de troubleshooting do 3scale, consumida pelo OLS através de
+2. **BYOK image** ([byok/](byok/)) — RAG knowledge base (FAISS) with
+   3scale troubleshooting runbooks, consumed by OLS through
    `spec.ols.rag`.
 
 ```
@@ -17,162 +17,162 @@ quay.io:
 │  namespace openshift-lightspeed          namespace 3scale     │
 │  ┌─────────────────────┐                ┌──────────────────┐  │
 │  │ OLS (lightspeed-app) │── MCP/HTTP ──▶│ APIManager, pods, │  │
-│  │  ├─ RAG: imagem BYOK │               │ routes, events…   │  │
-│  │  └─ MCP: 3scale-     │◀── leitura ───┤ (via API do K8s)  │  │
+│  │  ├─ RAG: BYOK image  │               │ routes, events…   │  │
+│  │  └─ MCP: 3scale-     │◀── read ──────┤ (via K8s API)     │  │
 │  │     troubleshoot     │               └──────────────────┘  │
 │  └─────────────────────┘                                      │
 └───────────────────────────────────────────────────────────────┘
 ```
 
-## Ferramentas MCP disponíveis
+## Available MCP tools
 
-| Ferramenta | Descrição |
+| Tool | Description |
 |---|---|
-| `diagnose_3scale` | Resumo de saúde em uma chamada: APIManager, deployments, pods, PVCs e eventos Warning |
-| `get_apimanager_status` | Condições de status do CR APIManager (apps.3scale.net) |
-| `list_3scale_pods` | Pods com fase, readiness, restarts e motivos de falha |
-| `get_pod_logs` | Logs de um pod (container, tail, instância anterior/crashada) |
-| `get_deployments` | Réplicas desejadas/prontas e condições não saudáveis |
-| `get_events` | Eventos do namespace (opcionalmente só Warning), mais recentes primeiro |
-| `check_routes` | Rotas (portais e gateways) com host, TLS e status de admissão |
-| `check_database_config` | Configuração dos bancos a partir dos secrets (`backend-redis`, `system-redis`, `system-database`, `zync`) com credenciais censuradas, flags de `externalComponents` e teste opcional de conectividade TCP — essencial no 2.16, em que Redis e RDBMS são externos |
-| `check_pvcs` | PVCs com fase, capacidade e storage class |
+| `diagnose_3scale` | Health summary in one call: APIManager, deployments, pods, PVCs, and Warning events |
+| `get_apimanager_status` | Status conditions of the APIManager CR (apps.3scale.net) |
+| `list_3scale_pods` | Pods with phase, readiness, restarts, and failure reasons |
+| `get_pod_logs` | Logs from a pod (container, tail, previous/crashed instance) |
+| `get_deployments` | Desired/ready replicas and unhealthy conditions |
+| `get_events` | Namespace events (optionally Warning only), most recent first |
+| `check_routes` | Routes (portals and gateways) with host, TLS, and admission status |
+| `check_database_config` | Database configuration from secrets (`backend-redis`, `system-redis`, `system-database`, `zync`) with redacted credentials, `externalComponents` flags, and optional TCP connectivity test — essential on 2.16, where Redis and RDBMS are external |
+| `check_pvcs` | PVCs with phase, capacity, and storage class |
 
-Todas as ferramentas aceitam `namespace` opcional; o default vem de
-`THREESCALE_NAMESPACE` (padrão `3scale`).
+All tools accept an optional `namespace`; the default comes from
+`THREESCALE_NAMESPACE` (default `3scale`).
 
-## Pré-requisitos
+## Prerequisites
 
-- OpenShift 4.x com **OpenShift Lightspeed operator** instalado e OLSConfig
-  `cluster` funcional (provider LLM configurado)
-- 3scale API Management instalado via operator (CR `APIManager`)
-- `podman`, `oc`, `make`, Go ≥ 1.24 (apenas para build local)
-- Conta no [quay.io](https://quay.io) com um repositório **público** (ou pull
-  secret configurado no cluster para repositórios privados)
+- OpenShift 4.x with the **OpenShift Lightspeed operator** installed and a
+  working OLSConfig `cluster` (LLM provider configured)
+- 3scale API Management installed via the operator (`APIManager` CR)
+- `podman`, `oc`, `make`, Go ≥ 1.24 (local build only)
+- A [quay.io](https://quay.io) account with a **public** repository (or a pull
+  secret configured on the cluster for private repositories)
 
 ---
 
-## 1. Build e publicação do servidor MCP (quay.io)
+## 1. Build and publish the MCP server (quay.io)
 
 ```bash
 podman login quay.io
 
-# build + push (substitua CHANGE_ME pelo seu usuário/organização)
-make image-build image-push REGISTRY_ORG=<seu-usuario>
-# equivalente a:
-#   podman build -t quay.io/<seu-usuario>/3scale-troubleshoot-mcp:latest \
+# build + push (replace CHANGE_ME with your user/organization)
+make image-build image-push REGISTRY_ORG=<your-user>
+# equivalent to:
+#   podman build -t quay.io/<your-user>/3scale-troubleshoot-mcp:latest \
 #     -f mcp-server/Containerfile mcp-server/
-#   podman push quay.io/<seu-usuario>/3scale-troubleshoot-mcp:latest
+#   podman push quay.io/<your-user>/3scale-troubleshoot-mcp:latest
 ```
 
-Build local do binário (desenvolvimento): `make build`. Para rodar localmente
-contra o kubeconfig atual:
+Local binary build (development): `make build`. To run locally against the
+current kubeconfig:
 
 ```bash
 cd mcp-server && go run . -transport stdio -namespace 3scale
-# ou HTTP: go run . -transport http -listen :8080  →  endpoint http://localhost:8080/mcp
+# or HTTP: go run . -transport http -listen :8080  →  endpoint http://localhost:8080/mcp
 ```
 
-## 2. Build e publicação da imagem BYOK (quay.io)
+## 2. Build and publish the BYOK image (quay.io)
 
-A imagem é gerada pela ferramenta oficial `lightspeed-rag-tool` a partir dos
-markdowns de [byok/docs/](byok/docs/). Detalhes em [byok/README.md](byok/README.md).
+The image is generated by the official `lightspeed-rag-tool` from the
+markdown files in [byok/docs/](byok/docs/). Details in [byok/README.md](byok/README.md).
 
 ```bash
-podman login registry.redhat.io   # necessário para baixar a rag-tool
+podman login registry.redhat.io   # required to pull the rag-tool
 podman login quay.io
 
-make byok-push REGISTRY_ORG=<seu-usuario>
-# gera o índice FAISS, carrega byok-image.tar, tagueia e publica
-# quay.io/<seu-usuario>/3scale-docs-byok:latest
+make byok-push REGISTRY_ORG=<your-user>
+# generates the FAISS index, loads byok-image.tar, tags and publishes
+# quay.io/<your-user>/3scale-docs-byok:latest
 ```
 
-## 3. Instalação no cluster
+## 3. Cluster installation
 
-### 3.1 Deploy do servidor MCP
+### 3.1 Deploy the MCP server
 
 ```bash
-# RBAC (leitura de pods/logs/eventos/PVCs/deployments/routes/apimanagers)
-# + Deployment/Service no namespace openshift-lightspeed
-make deploy MCP_IMAGE=quay.io/<seu-usuario>/3scale-troubleshoot-mcp:latest
+# RBAC (read pods/logs/events/PVCs/deployments/routes/apimanagers)
+# + Deployment/Service in the openshift-lightspeed namespace
+make deploy MCP_IMAGE=quay.io/<your-user>/3scale-troubleshoot-mcp:latest
 
-# se o 3scale não estiver no namespace "3scale", ajuste:
+# if 3scale is not in the "3scale" namespace, adjust:
 oc set env deployment/threescale-troubleshoot-mcp -n openshift-lightspeed \
-  THREESCALE_NAMESPACE=<namespace-do-3scale>
+  THREESCALE_NAMESPACE=<3scale-namespace>
 
-# verificação
+# verification
 oc get pods -n openshift-lightspeed -l app=threescale-troubleshoot-mcp
 oc exec -n openshift-lightspeed deploy/threescale-troubleshoot-mcp -- \
   /bin/sh -c 'true' 2>/dev/null || true
 curl -s http://$(oc get svc threescale-troubleshoot-mcp -n openshift-lightspeed \
-  -o jsonpath='{.spec.clusterIP}'):8080/healthz   # a partir de um pod do cluster
+  -o jsonpath='{.spec.clusterIP}'):8080/healthz   # from a cluster pod
 ```
 
-### 3.2 Configuração do OLSConfig
+### 3.2 OLSConfig configuration
 
-Edite o OLSConfig `cluster` (`oc edit olsconfig cluster`) e **mescle** os
-campos abaixo — não substitua a configuração de provider existente. Exemplo
-completo em [deploy/30-olsconfig-example.yaml](deploy/30-olsconfig-example.yaml):
+Edit the OLSConfig `cluster` (`oc edit olsconfig cluster`) and **merge** the
+fields below — do not replace the existing provider configuration. Full
+example in [deploy/30-olsconfig-example.yaml](deploy/30-olsconfig-example.yaml):
 
 ```yaml
 spec:
   featureGates:
-    - MCPServer            # habilita a integração MCP (Tech Preview)
+    - MCPServer            # enables MCP integration (Tech Preview)
   mcpServers:
     - name: 3scale-troubleshoot
       url: "http://threescale-troubleshoot-mcp.openshift-lightspeed.svc.cluster.local:8080/mcp"
       timeout: 60
   ols:
     rag:
-      - image: quay.io/<seu-usuario>/3scale-docs-byok:latest
-        indexID: vector_db_index      # opcional (default)
-        indexPath: /rag/vector_db     # opcional (default)
+      - image: quay.io/<your-user>/3scale-docs-byok:latest
+        indexID: vector_db_index      # optional (default)
+        indexPath: /rag/vector_db     # optional (default)
 ```
 
-O operator do OLS reinicia o `lightspeed-app-server` aplicando o RAG e o MCP.
+The OLS operator restarts `lightspeed-app-server` applying the RAG and MCP.
 
-### 3.3 Verificação fim a fim
+### 3.3 End-to-end verification
 
 ```bash
 oc get pods -n openshift-lightspeed
 oc logs deployment/lightspeed-app-server -n openshift-lightspeed | grep -i -e mcp -e rag
 ```
 
-No console do OpenShift, abra o Lightspeed e pergunte, por exemplo:
+In the OpenShift console, open Lightspeed and ask, for example:
 
-- *"Diagnose my 3scale installation"* → deve acionar `diagnose_3scale`
-- *"Why are my 3scale admin portal routes missing?"* → deve combinar o runbook
-  de zync (RAG) com `check_routes`/`get_pod_logs` (MCP)
+- *"Diagnose my 3scale installation"* → should trigger `diagnose_3scale`
+- *"Why are my 3scale admin portal routes missing?"* → should combine the zync
+  runbook (RAG) with `check_routes`/`get_pod_logs` (MCP)
 
-## Estrutura do repositório
+## Repository structure
 
 ```
-├── mcp-server/          # servidor MCP em Go (main.go, k8s.go, tools.go, Containerfile)
-├── byok/                # docs markdown + build.sh da imagem BYOK
-│   └── docs/            # runbooks de troubleshooting do 3scale
-├── deploy/              # RBAC, Deployment/Service, exemplo de OLSConfig
+├── mcp-server/          # Go MCP server (main.go, k8s.go, tools.go, Containerfile)
+├── byok/                # markdown docs + BYOK image build.sh
+│   └── docs/            # 3scale troubleshooting runbooks
+├── deploy/              # RBAC, Deployment/Service, OLSConfig example
 ├── Makefile
 └── README.md
 ```
 
-## Segurança
+## Security
 
-- O servidor MCP é **somente leitura**: nenhuma ferramenta cria, altera ou
-  apaga recursos (RBAC restrito a `get`/`list`).
-- Secrets: o RBAC permite `get` apenas nos secrets de conexão de banco
+- The MCP server is **read-only**: no tool creates, updates, or deletes
+  resources (RBAC limited to `get`/`list`).
+- Secrets: RBAC allows `get` only on database connection secrets
   (`backend-redis`, `system-redis`, `system-database`, `zync`,
-  `system-memcache`) — necessários porque desde o 3scale 2.16 os bancos são
-  externos. Senhas **nunca** são retornadas: URLs são censuradas e chaves de
-  senha aparecem apenas como `[set, redacted]`.
-- Logs de pods podem conter dados sensíveis; o acesso ao OLS já exige
-  autorização no cluster, mas restrinja o ClusterRole a namespaces específicos
-  (troque por Role + RoleBinding) se necessário.
-- Container roda como usuário não-root, rootfs read-only e sem capabilities.
+  `system-memcache`) — required because since 3scale 2.16 databases are
+  external. Passwords are **never** returned: URLs are redacted and password
+  keys appear only as `[set, redacted]`.
+- Pod logs may contain sensitive data; OLS access already requires cluster
+  authorization, but restrict the ClusterRole to specific namespaces
+  (switch to Role + RoleBinding) if needed.
+- The container runs as non-root, with a read-only rootfs and no capabilities.
 
-## Referências
+## References
 
 - [Bring your own knowledge to OpenShift Lightspeed (Red Hat Blog)](https://www.redhat.com/en/blog/bring-your-own-knowledge-openshift-lightspeed)
-- [OpenShift Lightspeed — Configuração (docs oficiais)](https://docs.redhat.com/en/documentation/red_hat_openshift_lightspeed/1.0/html/configure/ols-configuring-openshift-lightspeed)
+- [OpenShift Lightspeed — Configuration (official docs)](https://docs.redhat.com/en/documentation/red_hat_openshift_lightspeed/1.0/html/configure/ols-configuring-openshift-lightspeed)
 - [OLSConfig API reference](https://docs.redhat.com/en/documentation/red_hat_openshift_lightspeed/1.0/html/configure/olsconfig-api)
-- [MCP Go SDK (oficial)](https://github.com/modelcontextprotocol/go-sdk)
+- [MCP Go SDK (official)](https://github.com/modelcontextprotocol/go-sdk)
 - [3scale operator](https://github.com/3scale/3scale-operator)
