@@ -1,0 +1,44 @@
+# ServiceAccount e RBAC (somente leitura) para o MCP server de troubleshooting do 3scale.
+# O servidor é implantado no namespace openshift-lightspeed para ficar ao lado do OLS.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: threescale-troubleshoot-mcp
+  namespace: openshift-lightspeed
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: threescale-troubleshoot-mcp-reader
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events", "persistentvolumeclaims", "services"]
+    verbs: ["get", "list"]
+  # Secrets de conexão dos bancos (externos a partir do 3scale 2.16).
+  # Somente "get" e somente os nomes listados; o servidor censura credenciais.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+    resourceNames: ["backend-redis", "system-redis", "system-database", "zync", "system-memcache"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["route.openshift.io"]
+    resources: ["routes"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps.3scale.net"]
+    resources: ["apimanagers"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: threescale-troubleshoot-mcp-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: threescale-troubleshoot-mcp-reader
+subjects:
+  - kind: ServiceAccount
+    name: threescale-troubleshoot-mcp
+    namespace: openshift-lightspeed

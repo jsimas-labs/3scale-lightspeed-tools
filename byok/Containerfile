@@ -1,0 +1,11 @@
+# Imagem BYOK final: apenas empacota o índice FAISS já gerado (byok/output/vector_db)
+# numa base UBI mínima. Construída explicitamente para linux/amd64 (nós do OpenShift).
+#
+# O índice é gerado antes por build.sh rodando generate_embeddings_tool.py da
+# lightspeed-rag-tool — desacoplado do buildah aninhado da ferramenta, que não
+# funciona sob emulação amd64 em hosts arm64.
+FROM registry.access.redhat.com/ubi9/ubi-micro:latest
+LABEL name="3scale-docs-byok" \
+      summary="OpenShift Lightspeed BYOK RAG image with 3scale troubleshooting knowledge" \
+      io.k8s.display-name="3scale Docs BYOK"
+COPY output/vector_db /rag/vector_db

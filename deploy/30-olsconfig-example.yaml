@@ -1,0 +1,25 @@
+# Exemplo de OLSConfig integrando:
+#  - o MCP server de troubleshooting do 3scale (spec.mcpServers + featureGates)
+#  - a imagem BYOK com a documentação do 3scale (spec.ols.rag)
+#
+# NÃO aplique este arquivo diretamente: mescle os campos no OLSConfig "cluster"
+# existente, preservando sua configuração de provider/LLM atual.
+apiVersion: ols.openshift.io/v1alpha1
+kind: OLSConfig
+metadata:
+  name: cluster
+spec:
+  featureGates:
+    - MCPServer
+  mcpServers:
+    - name: 3scale-troubleshoot
+      url: "http://threescale-troubleshoot-mcp.openshift-lightspeed.svc.cluster.local:8080/mcp"
+      timeout: 60
+  llm:
+    providers: []   # mantenha o(s) provider(s) já configurado(s)
+  ols:
+    defaultModel: ""   # mantenha o modelo já configurado
+    rag:
+      - image: quay.io/jsimas/3scale-docs-byok:latest
+        indexID: vector_db_index
+        indexPath: /rag/vector_db

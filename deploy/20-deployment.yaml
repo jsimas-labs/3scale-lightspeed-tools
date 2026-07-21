@@ -1,0 +1,71 @@
+# Deployment do MCP server. Ajuste a imagem para o seu repositório no quay.io
+# e THREESCALE_NAMESPACE para o namespace onde o 3scale (APIManager) está instalado.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: threescale-troubleshoot-mcp
+  namespace: openshift-lightspeed
+  labels:
+    app: threescale-troubleshoot-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: threescale-troubleshoot-mcp
+  template:
+    metadata:
+      labels:
+        app: threescale-troubleshoot-mcp
+    spec:
+      serviceAccountName: threescale-troubleshoot-mcp
+      containers:
+        - name: mcp-server
+          image: quay.io/CHANGE_ME/3scale-troubleshoot-mcp:latest
+          args: ["-transport", "http", "-listen", ":8080"]
+          env:
+            - name: THREESCALE_NAMESPACE
+              value: "3scale"
+          ports:
+            - containerPort: 8080
+              name: mcp
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: threescale-troubleshoot-mcp
+  namespace: openshift-lightspeed
+  labels:
+    app: threescale-troubleshoot-mcp
+spec:
+  selector:
+    app: threescale-troubleshoot-mcp
+  ports:
+    - name: mcp
+      port: 8080
+      targetPort: 8080
