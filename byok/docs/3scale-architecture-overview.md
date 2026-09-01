@@ -72,3 +72,27 @@ state. RWX storage (e.g. ODF `ocs-storagecluster-cephfs`, NFS) is required for
 
 A failure in any of these hops surfaces as gateway errors: check APIcast logs
 first, then backend-listener, then backend-redis connectivity.
+
+## Gateway topology: APIcast is not confined to one namespace
+
+Besides the `apicast-staging` and `apicast-production` Deployments that the
+3scale operator creates next to the APIManager, the **APIcast operator** can
+deploy self-managed gateways (kind `APIcast`, `apps.3scale.net/v1alpha1`) in any
+namespace of the cluster — commonly one per team, environment or network zone.
+Each of those is a Deployment named `apicast-<CR name>` in the namespace of its
+custom resource, and each needs its own ServiceMonitor for metrics.
+
+When troubleshooting, discover the gateways instead of assuming their location
+(`3scale_list_apicast_gateways`), and remember that the same API can be served
+by several gateways at once: an error confined to one namespace or deployment is
+a gateway problem, not an API problem. See
+`apicast-operator-multi-namespace.md`.
+
+## Observability
+
+APIcast exports Prometheus metrics on port 9421. With
+`APICAST_EXTENDED_METRICS=true` the traffic metrics carry `service_id` and
+`service_system_name` labels, which is what allows traffic, error rates and
+latency to be analysed per API rather than per gateway. Collection on OpenShift
+requires user workload monitoring to be enabled and a ServiceMonitor in each
+namespace that hosts gateways. See `apicast-metrics-reference.md`.

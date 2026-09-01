@@ -36,9 +36,11 @@ type eventsInput struct {
 	Limit        int    `json:"limit,omitempty" jsonschema:"maximum number of events to return (optional, default 30)"`
 }
 
-func registerTools(server *mcp.Server, kc *k8sClients) {
+func registerTools(server *mcp.Server, d *deps) {
+	kc := d.kc
+
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "diagnose_3scale",
+		Name: "3scale_diagnose",
 		Description: "One-shot health summary of a 3scale API Management installation: APIManager status conditions, " +
 			"deployments that are not ready, pods that are not running/ready (with container failure reasons), " +
 			"unbound PersistentVolumeClaims and recent Warning events. Use this first when troubleshooting.",
@@ -47,7 +49,7 @@ func registerTools(server *mcp.Server, kc *k8sClients) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "get_apimanager_status",
+		Name: "3scale_get_apimanager_status",
 		Description: "Get the APIManager custom resource(s) (apps.3scale.net/v1alpha1) in the namespace: wildcard domain, " +
 			"version and status conditions reported by the 3scale operator.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in nsInput) (*mcp.CallToolResult, any, error) {
@@ -59,11 +61,11 @@ func registerTools(server *mcp.Server, kc *k8sClients) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "list_3scale_pods",
+		Name: "3scale_list_pods",
 		Description: "List all pods in the 3scale namespace with phase, readiness, restart counts, failure reasons and age. " +
 			"Covers apicast-staging/production, system-app, system-sidekiq, system-searchd, backend-listener/worker/cron, " +
 			"zync, zync-que and memcached. Note: since 3scale 2.16 Redis and (usually) the system database are external " +
-			"and have no pods here — use check_database_config for those.",
+			"and have no pods here — use 3scale_check_database_config for those.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in nsInput) (*mcp.CallToolResult, any, error) {
 		out, err := listPods(ctx, kc, kc.namespaceOr(in.Namespace))
 		if err != nil {
@@ -73,7 +75,7 @@ func registerTools(server *mcp.Server, kc *k8sClients) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "get_pod_logs",
+		Name: "3scale_get_pod_logs",
 		Description: "Fetch recent logs from a pod in the 3scale namespace. Supports selecting the container, tailing N lines " +
 			"and reading the previous (crashed) container instance, which is essential for CrashLoopBackOff analysis.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in podLogsInput) (*mcp.CallToolResult, any, error) {
@@ -85,7 +87,7 @@ func registerTools(server *mcp.Server, kc *k8sClients) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "get_deployments",
+		Name: "3scale_get_deployments",
 		Description: "List Deployments in the 3scale namespace with desired/ready/available replica counts and any " +
 			"non-healthy conditions (e.g. ProgressDeadlineExceeded).",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in nsInput) (*mcp.CallToolResult, any, error) {
@@ -97,7 +99,7 @@ func registerTools(server *mcp.Server, kc *k8sClients) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "get_events",
+		Name: "3scale_get_events",
 		Description: "List recent Kubernetes events in the 3scale namespace (optionally only Warning events), newest first. " +
 			"Useful to spot scheduling failures, image pull errors, probe failures and OOM kills.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in eventsInput) (*mcp.CallToolResult, any, error) {
@@ -109,7 +111,7 @@ func registerTools(server *mcp.Server, kc *k8sClients) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "check_routes",
+		Name: "3scale_check_routes",
 		Description: "List OpenShift Routes in the 3scale namespace (admin/master/developer portals, apicast gateways) with " +
 			"host, target service, TLS termination and admission status. Missing or not-admitted routes commonly " +
 			"indicate zync-que replication problems.",
@@ -122,7 +124,7 @@ func registerTools(server *mcp.Server, kc *k8sClients) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "check_database_config",
+		Name: "3scale_check_database_config",
 		Description: "Inspect the database configuration of 3scale from its connection secrets (backend-redis, system-redis, " +
 			"system-database, zync) with all credentials redacted. Since 3scale 2.16 the backend/system Redis databases " +
 			"are always external (not deployed by the operator) and the system RDBMS may be, so troubleshooting database " +
@@ -137,12 +139,104 @@ func registerTools(server *mcp.Server, kc *k8sClients) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "check_pvcs",
+		Name: "3scale_check_pvcs",
 		Description: "List PersistentVolumeClaims in the 3scale namespace (system-storage and, on installs with " +
 			"self-managed in-cluster databases, database volumes) with phase, capacity, access modes and storage class. " +
 			"Pending PVCs block the dependent pods from starting.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in nsInput) (*mcp.CallToolResult, any, error) {
 		out, err := listPVCs(ctx, kc, kc.namespaceOr(in.Namespace))
+		if err != nil {
+			return nil, nil, err
+		}
+		return textResult(out), nil, nil
+	})
+
+	// ---- APIcast topology and metrics ----
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "3scale_list_apicast_gateways",
+		Description: "Discover every APIcast gateway in the cluster, in ANY namespace: the staging/production gateways " +
+			"deployed next to an APIManager and the self-managed gateways created by the APIcast operator (kind APIcast, " +
+			"apps.3scale.net/v1alpha1). Reports namespace, readiness, managing operator, image, the APICAST_* settings that " +
+			"matter (extended metrics, response codes, configuration cache, log level, portal endpoint with credentials " +
+			"redacted) and whether a ServiceMonitor/PodMonitor exists. Start here when you do not know where the gateways " +
+			"are, or when per-API metrics come back empty.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in nsInput) (*mcp.CallToolResult, any, error) {
+		gws, warns, err := discoverGateways(ctx, d.kc, in.Namespace)
+		if err != nil {
+			return nil, nil, err
+		}
+		return textResult(renderGateways(gws, warns)), nil, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "3scale_list_apis",
+		Description: "List the APIs (3scale products) served by APIcast in a time window, ranked by traffic, with request " +
+			"count, 4xx, 5xx and error rate for each, plus the namespaces serving them. Product display names come from the " +
+			"3scale Admin API when reachable; products configured but idle in the window are listed separately. Use this to " +
+			"find which API to investigate, or to confirm that an API is receiving traffic at all.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listAPIsInput) (*mcp.CallToolResult, any, error) {
+		out, err := listAPIs(ctx, d, in)
+		if err != nil {
+			return nil, nil, err
+		}
+		return textResult(out), nil, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "3scale_analyze_api_metrics",
+		Description: "Analyse ONE API from APIcast metrics. Finds the API by product name, system name or numeric service id " +
+			"and returns: total requests and rate; the full HTTP status-code breakdown with counts, shares and what each code " +
+			"usually means in APIcast; 2xx/4xx/5xx split; traffic and 5xx per gateway (across namespaces); latency (avg/p95/p99) " +
+			"for the client-observed total and for the upstream API, isolating APIcast overhead; the calls APIcast makes to " +
+			"3scale backend; a request/error timeline; the state of the APIcast pods serving it; and automatic findings that " +
+			"name the probable cause. This is the main tool for 'why is my API returning errors / slow'.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in analyzeAPIInput) (*mcp.CallToolResult, any, error) {
+		out, err := analyzeAPI(ctx, d, in)
+		if err != nil {
+			return nil, nil, err
+		}
+		return textResult(out), nil, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "3scale_traffic_overview",
+		Description: "Cluster-wide APIcast traffic health for a time window: total requests and status-class split, traffic and " +
+			"error rate per gateway and namespace, the APIs producing the most 5xx, the calls to 3scale backend, nginx error-log " +
+			"volume by level, nginx connection states and shared dictionaries close to full. Use it when the question is about " +
+			"the gateway fleet rather than one API.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in overviewInput) (*mcp.CallToolResult, any, error) {
+		out, err := trafficOverview(ctx, d, in)
+		if err != nil {
+			return nil, nil, err
+		}
+		return textResult(out), nil, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "3scale_check_metrics_pipeline",
+		Description: "Explain why APIcast metrics are missing or incomplete. Checks the gateways found in every namespace and " +
+			"their APICAST_EXTENDED_METRICS setting, the presence of ServiceMonitors/PodMonitors, whether OpenShift user " +
+			"workload monitoring is enabled, whether Prometheus/Thanos answers and which APIcast metrics and per-API labels " +
+			"exist, plus scrape target health and 3scale Admin API reachability. Returns the exact configuration to apply. " +
+			"Call this whenever a metrics tool returns no data.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in nsInput) (*mcp.CallToolResult, any, error) {
+		out, err := checkMetricsPipeline(ctx, d, in)
+		if err != nil {
+			return nil, nil, err
+		}
+		return textResult(out), nil, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "3scale_query_metrics",
+		Description: "Run an arbitrary read-only PromQL query against the cluster monitoring stack, as an instant or range " +
+			"query. Use it only when the dedicated tools do not cover the question. Useful APIcast metrics: upstream_status " +
+			"(counter, labels status/service_id/service_system_name), total_response_time_seconds and " +
+			"upstream_response_time_seconds (histograms), threescale_backend_calls (labels endpoint/status), " +
+			"nginx_http_connections, nginx_error_log, openresty_shdict_free_space and openresty_shdict_capacity.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in promQueryInput) (*mcp.CallToolResult, any, error) {
+		out, err := queryMetrics(ctx, d, in)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -169,7 +263,7 @@ func listPods(ctx context.Context, kc *k8sClients, ns string) (string, error) {
 		return "", fmt.Errorf("listing pods in %q: %w", ns, err)
 	}
 	if len(pods.Items) == 0 {
-		return fmt.Sprintf("No pods found in namespace %q. Verify that 3scale is installed in this namespace.", ns), nil
+		return fmt.Sprintf("No pods found in namespace %q. Verify that 3scale is installed in this namespace.%s", ns, namespaceHint(ctx, kc)), nil
 	}
 
 	var b strings.Builder
@@ -384,7 +478,8 @@ func apiManagerStatus(ctx context.Context, kc *k8sClients, ns string) (string, e
 		return "", fmt.Errorf("listing APIManager resources in %q (is the 3scale operator installed?): %w", ns, err)
 	}
 	if len(list.Items) == 0 {
-		return fmt.Sprintf("No APIManager custom resource found in namespace %q. 3scale may not be installed here, or it was installed without the operator.", ns), nil
+		return fmt.Sprintf("No APIManager custom resource found in namespace %q. 3scale may not be installed here, or it was installed without the operator. "+
+			"Self-managed APIcast gateways can also exist without an APIManager — use 3scale_list_apicast_gateways.%s", ns, namespaceHint(ctx, kc)), nil
 	}
 	var b strings.Builder
 	for i := range list.Items {
@@ -624,7 +719,7 @@ func diagnose(ctx context.Context, kc *k8sClients, ns string) string {
 	if problems == 0 {
 		b.WriteString("no problems detected. The 3scale installation looks healthy. ===\n")
 	} else {
-		fmt.Fprintf(&b, "%d potential problem(s) detected. Drill down with get_pod_logs, get_events and check_routes. ===\n", problems)
+		fmt.Fprintf(&b, "%d potential problem(s) detected. Drill down with 3scale_get_pod_logs, 3scale_get_events and 3scale_check_routes. ===\n", problems)
 	}
 	return b.String()
 }

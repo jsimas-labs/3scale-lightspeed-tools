@@ -1,0 +1,70 @@
+# Reference configuration that makes per-API metrics available to the MCP
+# server. Apply one ServiceMonitor per namespace that hosts APIcast gateways —
+# with the APIcast operator that is typically one namespace per team.
+#
+# Prerequisite (cluster admin, once per cluster): enable user workload
+# monitoring, otherwise nothing scrapes APIcast at all.
+#
+#   oc -n openshift-monitoring edit configmap cluster-monitoring-config
+#   data:
+#     config.yaml: |
+#       enableUserWorkload: true
+---
+# APIcast exposes Prometheus metrics on port 9421 (/metrics).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: apicast
+  namespace: 3scale            # repeat in every namespace holding gateways
+  labels:
+    app: apicast
+spec:
+  selector:
+    matchLabels:
+      # APIManager-managed gateways use threescale_component: apicast;
+      # APIcast-operator gateways use app: apicast. Match what `oc get svc
+      # --show-labels` reports in your namespace.
+      app: apicast
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+---
+# Per-API labels (service_id, service_system_name) on upstream_status and on
+# the response-time histograms. WITHOUT this, metrics only describe the gateway
+# as a whole and 3scale_analyze_api_metrics cannot break traffic down per API.
+#
+# What matters is that APICAST_EXTENDED_METRICS=true reaches the apicast
+# container. The CR field that sets it depends on the operator version, so
+# verify with 3scale_list_apicast_gateways after applying (it reads the variable
+# from the running pod spec). Do not edit the Deployment directly: the operator
+# reverts it on the next reconcile.
+#
+# Self-managed gateway (APIcast operator):
+apiVersion: apps.3scale.net/v1alpha1
+kind: APIcast
+metadata:
+  name: team-a
+  namespace: team-a
+spec:
+  adminPortalCredentialsRef:
+    name: apicast-admin-portal-credentials
+  extendedMetrics: true
+  # Also useful: reports the response code of every request back to 3scale
+  # backend, which is what powers per-status-code analytics in the Admin Portal.
+  # (Set through spec.customEnvironments or the operator field, depending on
+  # the APIcast operator version.)
+---
+# APIManager-managed gateways (staging and production):
+apiVersion: apps.3scale.net/v1alpha1
+kind: APIManager
+metadata:
+  name: apimanager
+  namespace: 3scale
+spec:
+  wildcardDomain: apps.example.com   # keep your existing value
+  apicast:
+    stagingSpec:
+      extendedMetrics: true
+    productionSpec:
+      extendedMetrics: true

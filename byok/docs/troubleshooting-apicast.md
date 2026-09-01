@@ -1,6 +1,17 @@
 # Troubleshooting APIcast (3scale API Gateway)
 
+> Start from the data when you can: `3scale_analyze_api_metrics` gives the
+> status-code distribution, latency split and per-gateway breakdown for a single
+> API, which usually identifies which symptom below applies. See
+> `apicast-metrics-reference.md` for what each metric means,
+> `troubleshooting-api-metrics.md` for metric-driven runbooks, and
+> `apicast-operator-multi-namespace.md` because gateways are not necessarily in
+> the API Manager namespace.
+
 ## Symptom: HTTP 404 "no mapping rule matched" on every request
+
+*Metric signature: `upstream_status{status="404"}` dominant for the service,
+latency normal.*
 
 - The request path does not match any **Mapping Rule** of the product.
   Check Product → Integration → Mapping Rules in the Admin Portal.
@@ -12,6 +23,9 @@
 
 ## Symptom: HTTP 403 "Authentication failed" or "Authentication parameters missing"
 
+*Metric signature: 403 dominant; check `threescale_backend_calls` to tell a
+credential problem from a backend outage.*
+
 - Wrong or missing credentials: user key (`user_key`), app_id/app_key pair or
   OIDC token, depending on the authentication mode of the product.
 - Verify the credential location (query, headers, basic auth) configured in
@@ -22,6 +36,10 @@
   requests. `oc logs deployment/backend-listener -n 3scale`.
 
 ## Symptom: HTTP 502/503 from APIcast
+
+*Metric signature: 502 with unchanged upstream latency points at the upstream
+connection; 503 together with non-2xx `threescale_backend_calls` points at
+3scale backend or its Redis.*
 
 - `502 Bad Gateway`: APIcast reached the upstream (Private Base URL) but the
   upstream failed or returned an invalid response. Check the upstream API and
@@ -51,6 +69,15 @@
   `oc rollout restart deployment/apicast-production -n 3scale`.
 - Confirm the configuration version deployed: Admin Portal → Product →
   Integration → Configuration shows the promoted version history.
+
+## Symptom: requests are slow
+
+*Metric signature: compare `total_response_time_seconds` with
+`upstream_response_time_seconds`. A large gap is APIcast overhead (authrep
+latency, policies, configuration reloads); a small gap means the upstream API is
+the slow part. 504 and 499 rise together when the upstream exceeds the timeout.*
+
+See `troubleshooting-api-metrics.md` for the full latency runbook.
 
 ## Useful checks
 

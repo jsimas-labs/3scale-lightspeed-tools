@@ -1,5 +1,9 @@
-# Deployment do MCP server. Ajuste a imagem para o seu repositório no quay.io
-# e THREESCALE_NAMESPACE para o namespace onde o 3scale (APIManager) está instalado.
+# Deployment of the MCP server. Point the image at your own repository and set
+# THREESCALE_NAMESPACE to the namespace where the 3scale APIManager is installed.
+#
+# APIcast gateways are discovered cluster-wide, so THREESCALE_NAMESPACE only
+# sets the default for the API Manager components (system, backend, zync) and
+# for the Admin API lookup used to resolve product names.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,8 +27,22 @@ spec:
           image: quay.io/CHANGE_ME/3scale-troubleshoot-mcp:latest
           args: ["-transport", "http", "-listen", ":8080"]
           env:
+            # Namespace of the APIManager. APIcast gateways deployed by the
+            # APIcast operator in other namespaces are found automatically.
             - name: THREESCALE_NAMESPACE
               value: "3scale"
+            # Thanos querier: federates the platform and user-workload
+            # Prometheus instances, so one endpoint covers every namespace.
+            # Set to "" to disable the metric tools entirely.
+            - name: PROMETHEUS_URL
+              value: "https://thanos-querier.openshift-monitoring.svc.cluster.local:9091"
+            # Resolving APIs by their Admin Portal display name uses the
+            # 3scale Account Management API (system-provider route +
+            # ADMIN_ACCESS_TOKEN from the system-seed secret). Set to "true"
+            # to switch it off; APIs can then only be addressed by system
+            # name or numeric service id.
+            - name: THREESCALE_DISABLE_ADMIN_API
+              value: "false"
           ports:
             - containerPort: 8080
               name: mcp
@@ -43,9 +61,9 @@ spec:
           resources:
             requests:
               cpu: 50m
-              memory: 64Mi
+              memory: 96Mi
             limits:
-              memory: 256Mi
+              memory: 384Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

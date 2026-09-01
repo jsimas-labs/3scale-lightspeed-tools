@@ -8,7 +8,11 @@ OpenShift Lightspeed containing a RAG knowledge base (FAISS) built from the
 
 | File | Topic |
 |---|---|
-| `docs/3scale-architecture-overview.md` | Architecture, components, routes, and traffic flow |
+| `docs/3scale-architecture-overview.md` | Architecture, components, routes, traffic flow, gateway topology and observability |
+| `docs/mcp-tools-playbook.md` | Which MCP tool to call for which symptom, and how to read its output |
+| `docs/apicast-metrics-reference.md` | APIcast Prometheus metrics, their labels, and thresholds for interpreting them |
+| `docs/troubleshooting-api-metrics.md` | Metric-signature runbooks: 502/503/504/499/403/404/429, latency, traffic loss |
+| `docs/apicast-operator-multi-namespace.md` | Self-managed gateways deployed by the APIcast operator in any namespace |
 | `docs/troubleshooting-apicast.md` | Gateway: 403/404/502, CrashLoop, configuration cache |
 | `docs/troubleshooting-system.md` | Admin/Developer Portal, sidekiq, searchd, credentials |
 | `docs/troubleshooting-backend.md` | listener/worker/cron, analytics, resque queues |
@@ -16,6 +20,11 @@ OpenShift Lightspeed containing a RAG knowledge base (FAISS) built from the
 | `docs/troubleshooting-databases.md` | External databases (2.16): connection secrets, Redis, MySQL/PostgreSQL, memcached |
 | `docs/troubleshooting-operator-apimanager.md` | Operator, APIManager CR, upgrades, must-gather |
 | `docs/troubleshooting-certificates-networking.md` | TLS, certificates, DNS, proxies |
+
+The four documents on MCP tools, metrics and gateway topology exist to make the model effective **with the MCP server**:
+they explain what each tool returns, what the metric names and labels mean, and
+how to turn a status-code distribution or a latency split into a root cause. The
+knowledge base and the MCP server are designed to be deployed together.
 
 You can add more `.md` files under `docs/` (including subdirectories) —
 for example, official 3scale documentation converted to markdown — and
@@ -94,3 +103,8 @@ podman rm tmp-rag
 After applying the OLSConfig, ask Lightspeed something like
 *"why are my 3scale routes missing?"* — the answer should reflect the runbook
 content (e.g. check zync-que and run `zync:resync:domains`).
+
+With the MCP server deployed as well, ask something like *"how is the Echo API
+doing in the last hour?"* or *"why is my API returning 502?"*: Lightspeed should
+call `3scale_analyze_api_metrics`, then explain the status-code distribution and
+the latency split using the vocabulary from these documents.

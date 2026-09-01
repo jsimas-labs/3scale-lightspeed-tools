@@ -1,5 +1,9 @@
-# ServiceAccount e RBAC (somente leitura) para o MCP server de troubleshooting do 3scale.
-# O servidor é implantado no namespace openshift-lightspeed para ficar ao lado do OLS.
+# ServiceAccount and read-only RBAC for the 3scale troubleshooting MCP server.
+# The server is deployed in the openshift-lightspeed namespace, next to OLS.
+#
+# The permissions are cluster-scoped on purpose: APIcast gateways created by
+# the APIcast operator can live in ANY namespace, so the server must be able to
+# discover and inspect them wherever they are. Everything granted is read-only.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -12,22 +16,41 @@ metadata:
   name: threescale-troubleshoot-mcp-reader
 rules:
   - apiGroups: [""]
-    resources: ["pods", "pods/log", "events", "persistentvolumeclaims", "services"]
+    resources: ["pods", "pods/log", "events", "persistentvolumeclaims", "services", "namespaces"]
     verbs: ["get", "list"]
-  # Secrets de conexão dos bancos (externos a partir do 3scale 2.16).
-  # Somente "get" e somente os nomes listados; o servidor censura credenciais.
+  # Database connection secrets (external since 3scale 2.16) and the seed
+  # secret holding the Admin API token used to resolve product names.
+  # Only "get", and only these names; the server redacts every credential.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get"]
-    resourceNames: ["backend-redis", "system-redis", "system-database", "zync", "system-memcache"]
+    resourceNames:
+      - backend-redis
+      - system-redis
+      - system-database
+      - zync
+      - system-memcache
+      - system-seed
+  # Read the cluster monitoring configuration to tell the user whether user
+  # workload monitoring (which collects the APIcast metrics) is enabled.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+    resourceNames: ["cluster-monitoring-config", "user-workload-monitoring-config"]
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets", "statefulsets"]
     verbs: ["get", "list"]
   - apiGroups: ["route.openshift.io"]
     resources: ["routes"]
     verbs: ["get", "list"]
+  # APIManager (API Manager installs) and APIcast (self-managed gateways from
+  # the APIcast operator, in any namespace).
   - apiGroups: ["apps.3scale.net"]
-    resources: ["apimanagers"]
+    resources: ["apimanagers", "apicasts"]
+    verbs: ["get", "list"]
+  # ServiceMonitors/PodMonitors tell us whether the gateways are scraped.
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["servicemonitors", "podmonitors"]
     verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -38,6 +61,22 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: threescale-troubleshoot-mcp-reader
+subjects:
+  - kind: ServiceAccount
+    name: threescale-troubleshoot-mcp
+    namespace: openshift-lightspeed
+---
+# Query APIcast metrics through the Thanos querier in openshift-monitoring.
+# cluster-monitoring-view is the OpenShift-provided ClusterRole for read-only
+# access to the platform and user-workload metrics.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: threescale-troubleshoot-mcp-monitoring-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-monitoring-view
 subjects:
   - kind: ServiceAccount
     name: threescale-troubleshoot-mcp

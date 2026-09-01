@@ -14,7 +14,12 @@ import (
 
 var (
 	apiManagerGVR = schema.GroupVersionResource{Group: "apps.3scale.net", Version: "v1alpha1", Resource: "apimanagers"}
-	routeGVR      = schema.GroupVersionResource{Group: "route.openshift.io", Version: "v1", Resource: "routes"}
+	// APIcast custom resources are created by the APIcast operator and may live
+	// in any namespace of the cluster, independently of the APIManager.
+	apicastGVR        = schema.GroupVersionResource{Group: "apps.3scale.net", Version: "v1alpha1", Resource: "apicasts"}
+	routeGVR          = schema.GroupVersionResource{Group: "route.openshift.io", Version: "v1", Resource: "routes"}
+	serviceMonitorGVR = schema.GroupVersionResource{Group: "monitoring.coreos.com", Version: "v1", Resource: "servicemonitors"}
+	podMonitorGVR     = schema.GroupVersionResource{Group: "monitoring.coreos.com", Version: "v1", Resource: "podmonitors"}
 )
 
 // k8sClients bundles the typed and dynamic Kubernetes clients used by the tools.

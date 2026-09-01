@@ -1,9 +1,18 @@
-# Exemplo de OLSConfig integrando:
-#  - o MCP server de troubleshooting do 3scale (spec.mcpServers + featureGates)
-#  - a imagem BYOK com a documentação do 3scale (spec.ols.rag)
+# Example OLSConfig wiring together:
+#  - the 3scale troubleshooting MCP server (spec.mcpServers + featureGates)
+#  - the BYOK image with the 3scale knowledge base (spec.ols.rag)
 #
-# NÃO aplique este arquivo diretamente: mescle os campos no OLSConfig "cluster"
-# existente, preservando sua configuração de provider/LLM atual.
+# Deploy both: the MCP server supplies live cluster and metric data, and the
+# BYOK index teaches the model how to interpret it (metric meanings, status-code
+# runbooks, which tool to call for which symptom).
+#
+# Do NOT apply this file as is: merge the fields into your existing "cluster"
+# OLSConfig, keeping your current provider/LLM configuration.
+#
+# The metric tools query APIcast metrics through the Thanos querier, so the MCP
+# ServiceAccount needs the cluster-monitoring-view ClusterRole (already included
+# in deploy/10-rbac.yaml) and user workload monitoring must be enabled
+# (see deploy/40-apicast-monitoring-example.yaml).
 apiVersion: ols.openshift.io/v1alpha1
 kind: OLSConfig
 metadata:
@@ -14,11 +23,11 @@ spec:
   mcpServers:
     - name: 3scale-troubleshoot
       url: "http://threescale-troubleshoot-mcp.openshift-lightspeed.svc.cluster.local:8080/mcp"
-      timeout: 60
+      timeout: 120   # metric analyses run several Prometheus queries
   llm:
-    providers: []   # mantenha o(s) provider(s) já configurado(s)
+    providers: []   # keep your existing provider(s)
   ols:
-    defaultModel: ""   # mantenha o modelo já configurado
+    defaultModel: ""   # keep your existing model
     rag:
       - image: quay.io/jsimas/3scale-docs-byok:latest
         indexID: vector_db_index
