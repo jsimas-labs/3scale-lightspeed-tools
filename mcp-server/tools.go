@@ -159,14 +159,18 @@ func registerTools(server *mcp.Server, d *deps) {
 			"deployed next to an APIManager and the self-managed gateways created by the APIcast operator (kind APIcast, " +
 			"apps.3scale.net/v1alpha1). Reports namespace, readiness, managing operator, image, the APICAST_* settings that " +
 			"matter (extended metrics, response codes, configuration cache, log level, portal endpoint with credentials " +
-			"redacted) and whether a ServiceMonitor/PodMonitor exists. Start here when you do not know where the gateways " +
-			"are, or when per-API metrics come back empty.",
+			"redacted) and whether a ServiceMonitor/PodMonitor exists. Always searches the ENTIRE cluster: in a typical install " +
+			"the APIManager namespace contains no gateway at all, because self-managed APIcast runs in its own namespaces. " +
+			"Start here when you do not know where the gateways are, or when per-API metrics come back empty.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in nsInput) (*mcp.CallToolResult, any, error) {
-		gws, warns, err := discoverGateways(ctx, d.kc, in.Namespace)
+		// Discovery is always cluster-wide; a namespace argument only
+		// highlights, because gateways commonly live outside the APIManager
+		// namespace and filtering would hide them.
+		gws, warns, err := discoverGateways(ctx, d.kc, "")
 		if err != nil {
 			return nil, nil, err
 		}
-		return textResult(renderGateways(gws, warns)), nil, nil
+		return textResult(renderGatewaysHighlighting(gws, warns, in.Namespace)), nil, nil
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -174,7 +178,8 @@ func registerTools(server *mcp.Server, d *deps) {
 		Description: "List the APIs (3scale products) served by APIcast in a time window, ranked by traffic, with request " +
 			"count, 4xx, 5xx and error rate for each, plus the namespaces serving them. Product display names come from the " +
 			"3scale Admin API when reachable; products configured but idle in the window are listed separately. Use this to " +
-			"find which API to investigate, or to confirm that an API is receiving traffic at all.",
+			"find which API to investigate, or to confirm that an API is receiving traffic at all. Searches the whole cluster; " +
+			"a namespace argument is a hint only and is widened automatically if it matches no traffic.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in listAPIsInput) (*mcp.CallToolResult, any, error) {
 		out, err := listAPIs(ctx, d, in)
 		if err != nil {
@@ -190,7 +195,8 @@ func registerTools(server *mcp.Server, d *deps) {
 			"usually means in APIcast; 2xx/4xx/5xx split; traffic and 5xx per gateway (across namespaces); latency (avg/p95/p99) " +
 			"for the client-observed total and for the upstream API, isolating APIcast overhead; the calls APIcast makes to " +
 			"3scale backend; a request/error timeline; the state of the APIcast pods serving it; and automatic findings that " +
-			"name the probable cause. This is the main tool for 'why is my API returning errors / slow'.",
+			"name the probable cause. This is the main tool for 'why is my API returning errors / slow'. " +
+			"The API is located CLUSTER-WIDE: do not pass a namespace to help it find one.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in analyzeAPIInput) (*mcp.CallToolResult, any, error) {
 		out, err := analyzeAPI(ctx, d, in)
 		if err != nil {

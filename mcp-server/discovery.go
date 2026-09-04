@@ -321,6 +321,34 @@ func namespaceHint(ctx context.Context, kc *k8sClients) string {
 
 // ---- rendering ----
 
+// renderGatewaysHighlighting reports every gateway in the cluster, noting
+// whether a namespace the caller asked about actually holds any. Filtering
+// would hide the gateways that matter: in the common topology the APIManager
+// namespace has none, and the gateways live in their own namespaces.
+func renderGatewaysHighlighting(gws []apicastGateway, warnings []string, asked string) string {
+	out := renderGateways(gws, warnings)
+	if asked == "" || len(gws) == 0 {
+		return out
+	}
+	var here, elsewhere []string
+	for _, g := range gws {
+		if g.Namespace == asked {
+			here = append(here, g.Deployment)
+		} else {
+			elsewhere = append(elsewhere, g.Namespace+"/"+g.Deployment)
+		}
+	}
+	var note string
+	if len(here) > 0 {
+		note = fmt.Sprintf("\nNamespace %q holds: %s.\n", asked, strings.Join(here, ", "))
+	} else {
+		note = fmt.Sprintf("\nNamespace %q holds no APIcast gateway. This is normal when it is the APIManager namespace: "+
+			"self-managed gateways run in their own namespaces. Gateways found elsewhere: %s.\n",
+			asked, strings.Join(dedupe(sortedCopy(elsewhere)), ", "))
+	}
+	return out + note
+}
+
 func renderGateways(gws []apicastGateway, warnings []string) string {
 	var b strings.Builder
 	if len(gws) == 0 {

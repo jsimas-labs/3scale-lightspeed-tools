@@ -46,7 +46,7 @@ func renderFindings(fs []finding) string {
 // ---- list APIs ----
 
 type listAPIsInput struct {
-	Namespace string `json:"namespace,omitempty" jsonschema:"restrict to one namespace (optional; by default every namespace with APIcast gateways is searched, since the APIcast operator can deploy gateways anywhere in the cluster)"`
+	Namespace string `json:"namespace,omitempty" jsonschema:"OPTIONAL and rarely needed: APIs and gateways are found cluster-wide. Pass this only to restrict to one namespace deliberately; if the API is served elsewhere the tool widens the search anyway and says so. Do NOT pass the APIManager namespace expecting to find gateways there - self-managed APIcast usually runs in other namespaces"`
 	Gateway   string `json:"gateway,omitempty" jsonschema:"restrict to one APIcast Deployment, e.g. apicast-production (optional)"`
 	Window    string `json:"window,omitempty" jsonschema:"time window such as 15m, 1h, 24h or 7d (optional, default 1h)"`
 }
@@ -59,15 +59,14 @@ func listAPIs(ctx context.Context, d *deps, in listAPIsInput) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	sc := scopeFor(in.Namespace, in.Gateway)
-	catalogMetrics, err := d.prom.metricCatalog(ctx)
+	sc := resolveScope(ctx, d, in.Namespace, in.Gateway)
+	catalogMetrics, err := d.prom.metricCatalog(ctx, sc.matchers(), window)
 	if err != nil {
 		return "", err
 	}
 	statusMetric := metricName(catalogMetrics, "upstream_status")
 	if statusMetric == "" {
-		return "No APIcast traffic metrics (upstream_status) are present in Prometheus.\n" +
-			"Run 3scale_check_metrics_pipeline: either the gateways are not being scraped, or no request has been served yet.", nil
+		return explainNoMetrics(ctx, d, sc, window), nil
 	}
 
 	sel := sc.matchers()
@@ -79,6 +78,23 @@ func listAPIs(ctx context.Context, d *deps, in listAPIsInput) (string, error) {
 	res := runQueries(ctx, d.prom, queries)
 	if res["total"].err != nil {
 		return "", res["total"].err
+	}
+	// A namespace hint must never hide APIs: if it matched nothing, fall back
+	// to the whole cluster. The APIManager namespace commonly has no gateways.
+	var widened string
+	if len(res["total"].samples) == 0 && len(sc.Namespaces) > 0 {
+		wide := clusterScope(in.Gateway)
+		wideSel := wide.matchers()
+		res = runQueries(ctx, d.prom, map[string]string{
+			"total": fmt.Sprintf("sum by (service_id, service_system_name, namespace) (increase(%s{%s}[%s]))", statusMetric, wideSel, window),
+			"c4xx":  fmt.Sprintf(`sum by (service_id, service_system_name) (increase(%s{%s}[%s]))`, statusMetric, joinSelectors(wideSel, `status=~"4.."`), window),
+			"c5xx":  fmt.Sprintf(`sum by (service_id, service_system_name) (increase(%s{%s}[%s]))`, statusMetric, joinSelectors(wideSel, `status=~"5.."`), window),
+		})
+		if len(res["total"].samples) > 0 {
+			widened = fmt.Sprintf("No APIcast traffic in %s; widened the search to the whole cluster.",
+				strings.Join(sc.Namespaces, ", "))
+			sc = wide
+		}
 	}
 
 	type row struct {
@@ -126,7 +142,11 @@ func listAPIs(ctx context.Context, d *deps, in listAPIsInput) (string, error) {
 	sort.Slice(list, func(i, j int) bool { return list[i].total > list[j].total })
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "APIs served by APIcast in the last %s (%s):\n\n", window, sc.describe())
+	fmt.Fprintf(&b, "APIs served by APIcast in the last %s (%s):\n", window, sc.describe())
+	if widened != "" {
+		fmt.Fprintf(&b, "%s\n", widened)
+	}
+	b.WriteString("\n")
 	if len(list) == 0 {
 		b.WriteString("No traffic recorded in this window.\n")
 	} else {
@@ -187,7 +207,7 @@ func listAPIs(ctx context.Context, d *deps, in listAPIsInput) (string, error) {
 
 type analyzeAPIInput struct {
 	API       string `json:"api" jsonschema:"the API to analyse: product name as shown in the Admin Portal, its system name, or its numeric service id"`
-	Namespace string `json:"namespace,omitempty" jsonschema:"restrict to one namespace (optional; by default all namespaces with APIcast gateways are considered)"`
+	Namespace string `json:"namespace,omitempty" jsonschema:"OPTIONAL and rarely needed: APIs and gateways are found cluster-wide. Pass this only to restrict to one namespace deliberately; if the API is served elsewhere the tool widens the search anyway and says so. Do NOT pass the APIManager namespace expecting to find gateways there - self-managed APIcast usually runs in other namespaces"`
 	Gateway   string `json:"gateway,omitempty" jsonschema:"restrict to one APIcast Deployment, e.g. apicast-production or apicast-staging (optional)"`
 	Window    string `json:"window,omitempty" jsonschema:"time window such as 15m, 1h, 24h or 7d (optional, default 1h)"`
 	NoTrend   bool   `json:"noTrend,omitempty" jsonschema:"skip the request/error timeline (optional)"`
@@ -201,18 +221,39 @@ func analyzeAPI(ctx context.Context, d *deps, in analyzeAPIInput) (string, error
 	if err != nil {
 		return "", err
 	}
-	sc := scopeFor(in.Namespace, in.Gateway)
+	sc := resolveScope(ctx, d, in.Namespace, in.Gateway)
 	api, err := resolveAPI(ctx, d, in.API, in.Namespace, window, sc)
 	if err != nil {
 		return "", err
 	}
-	catalogMetrics, err := d.prom.metricCatalog(ctx)
+	// Now that the API has been located cluster-wide, narrow the metric
+	// queries to the namespaces actually serving it — precise, and without
+	// ever having used a namespace as a filter while searching.
+	//
+	// A namespace argument is a hint, never a blindfold. In the usual topology
+	// the APIManager lives in one namespace and the APIcast gateways in
+	// others, so a caller naming "the 3scale namespace" would otherwise get an
+	// empty report for an API that is plainly serving traffic next door.
+	var scopeNote string
+	if len(api.Namespaces) > 0 {
+		if in.Namespace != "" && !contains(api.Namespaces, in.Namespace) {
+			scopeNote = fmt.Sprintf("You asked for namespace %q, but this API is served from %s — "+
+				"reporting on where its traffic actually is. (In a typical install the APIManager and the APIcast "+
+				"gateways are in different namespaces.)", in.Namespace, strings.Join(api.Namespaces, ", "))
+		}
+		sc = metricScope{
+			Namespaces: api.Namespaces,
+			Gateway:    in.Gateway,
+			Origin:     "namespaces where this API's traffic was found",
+		}
+	}
+	catalogMetrics, err := d.prom.metricCatalog(ctx, sc.matchers(), window)
 	if err != nil {
 		return "", err
 	}
 	statusMetric := metricName(catalogMetrics, "upstream_status")
 	if statusMetric == "" {
-		return "", fmt.Errorf("upstream_status is not present in Prometheus; run 3scale_check_metrics_pipeline")
+		return explainNoMetrics(ctx, d, sc, window), nil
 	}
 
 	apiSel := api.selector()
@@ -244,6 +285,9 @@ func analyzeAPI(ctx context.Context, d *deps, in analyzeAPIInput) (string, error
 	}
 	if len(api.Namespaces) > 0 {
 		fmt.Fprintf(&b, "Served from namespace(s): %s\n", strings.Join(api.Namespaces, ", "))
+	}
+	if scopeNote != "" {
+		fmt.Fprintf(&b, "\n%s\n", scopeNote)
 	}
 	if !api.HasTraffic {
 		b.WriteString("\nThis product exists in 3scale but produced NO traffic in this window.\n" +
@@ -478,7 +522,7 @@ func apiFindings(sb statusBreakdown, totalLat, upstreamLat latency, res map[stri
 // ---- traffic overview ----
 
 type overviewInput struct {
-	Namespace string `json:"namespace,omitempty" jsonschema:"restrict to one namespace (optional; default is the whole cluster)"`
+	Namespace string `json:"namespace,omitempty" jsonschema:"OPTIONAL and rarely needed: APIs and gateways are found cluster-wide. Pass this only to restrict to one namespace deliberately; if the API is served elsewhere the tool widens the search anyway and says so. Do NOT pass the APIManager namespace expecting to find gateways there - self-managed APIcast usually runs in other namespaces"`
 	Window    string `json:"window,omitempty" jsonschema:"time window such as 15m, 1h, 24h or 7d (optional, default 1h)"`
 }
 
@@ -490,15 +534,15 @@ func trafficOverview(ctx context.Context, d *deps, in overviewInput) (string, er
 	if err != nil {
 		return "", err
 	}
-	sc := scopeFor(in.Namespace, "")
+	sc := resolveScope(ctx, d, in.Namespace, "")
 	sel := sc.matchers()
-	catalogMetrics, err := d.prom.metricCatalog(ctx)
+	catalogMetrics, err := d.prom.metricCatalog(ctx, sel, window)
 	if err != nil {
 		return "", err
 	}
 	statusMetric := metricName(catalogMetrics, "upstream_status")
 	if statusMetric == "" {
-		return "No APIcast traffic metrics found in Prometheus. Run 3scale_check_metrics_pipeline.", nil
+		return explainNoMetrics(ctx, d, sc, window), nil
 	}
 
 	queries := map[string]string{
@@ -521,6 +565,12 @@ func trafficOverview(ctx context.Context, d *deps, in overviewInput) (string, er
 		queries["shdict"] = fmt.Sprintf("min by (namespace, dict) (%s{%s} / %s{%s})", free, sel, capacity, sel)
 	}
 	res := runQueries(ctx, d.prom, queries)
+	if len(res["byStatus"].samples) == 0 && len(sc.Namespaces) > 0 {
+		// Same rule as elsewhere: a namespace hint must not hide the fleet.
+		if wide, wres, ok := retryClusterWide(ctx, d, queries, sc); ok {
+			sc, res = wide, wres
+		}
+	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "=== APIcast traffic overview (last %s, %s) ===\n", window, sc.describe())
@@ -645,6 +695,43 @@ func trafficOverview(ctx context.Context, d *deps, in overviewInput) (string, er
 	return b.String(), nil
 }
 
+// retryClusterWide re-runs a query set with the namespace matcher removed. It
+// is used whenever a namespace hint produced nothing, so that a caller naming
+// the APIManager namespace still sees the gateways in other namespaces.
+func retryClusterWide(ctx context.Context, d *deps, queries map[string]string, sc metricScope) (metricScope, map[string]queryResult, bool) {
+	narrow := sc.matchers()
+	if narrow == "" {
+		return sc, nil, false
+	}
+	wide := clusterScope(sc.Gateway)
+	rewritten := make(map[string]string, len(queries))
+	for name, q := range queries {
+		rewritten[name] = stripMatcher(q, narrow)
+	}
+	res := runQueries(ctx, d.prom, rewritten)
+	for _, r := range res {
+		if r.err == nil && len(r.samples) > 0 {
+			wide.Origin = "widened from " + strings.Join(sc.Namespaces, ", ") + ": no traffic there"
+			return wide, res, true
+		}
+	}
+	return sc, nil, false
+}
+
+// stripMatcher removes a label matcher from every selector in a PromQL
+// expression without leaving the dangling commas that would make the result
+// unparseable ("{,status=~\"5..\"}").
+func stripMatcher(query, matcher string) string {
+	if matcher == "" {
+		return query
+	}
+	out := query
+	for _, form := range []string{matcher + ",", "," + matcher, matcher} {
+		out = strings.ReplaceAll(out, form, "")
+	}
+	return out
+}
+
 // ---- metrics pipeline check ----
 
 func checkMetricsPipeline(ctx context.Context, d *deps, in nsInput) (string, error) {
@@ -653,7 +740,9 @@ func checkMetricsPipeline(ctx context.Context, d *deps, in nsInput) (string, err
 	ok, problems := true, 0
 
 	// 1. Gateways and their metric settings.
-	gws, warns, err := discoverGateways(ctx, d.kc, in.Namespace)
+	// Always cluster-wide: gateways are routinely deployed away from the
+	// APIManager, and a namespace-filtered search would report "none found".
+	gws, warns, err := discoverGateways(ctx, d.kc, "")
 	b.WriteString("--- 1. APIcast gateways ---\n")
 	if err != nil {
 		problems++
@@ -677,6 +766,21 @@ func checkMetricsPipeline(ctx context.Context, d *deps, in nsInput) (string, err
 			if len(g.Monitors) == 0 {
 				problems++
 				fmt.Fprintf(&b, "  %s: no ServiceMonitor/PodMonitor in this namespace — Prometheus has nothing telling it to scrape port 9421.\n", g.Namespace)
+			}
+		}
+		// A ServiceMonitor pointing at a port the Service does not expose
+		// scrapes nothing, silently. Check the Services behind the gateways.
+		for _, ns := range gatewayNamespaces(gws) {
+			exposed, err := metricsPortServices(ctx, d, ns)
+			switch {
+			case err != nil:
+				fmt.Fprintf(&b, "  %s: could not list Services: %v\n", ns, err)
+			case len(exposed) == 0:
+				problems++
+				fmt.Fprintf(&b, "  %s: no Service exposes the APIcast metrics port 9421 — a ServiceMonitor in this namespace "+
+					"has no port to scrape. Add the port to the gateway Service, or use a PodMonitor instead.\n", ns)
+			default:
+				fmt.Fprintf(&b, "  %s: metrics port exposed by Service(s) %s\n", ns, strings.Join(exposed, ", "))
 			}
 		}
 	}
@@ -707,7 +811,9 @@ func checkMetricsPipeline(ctx context.Context, d *deps, in nsInput) (string, err
 		fmt.Fprintf(&b, "  %s\n", promDisabledMsg)
 	} else {
 		fmt.Fprintf(&b, "  endpoint: %s\n", d.prom.baseURL)
-		catalog, cerr := d.prom.metricCatalog(ctx)
+		pipelineScope := resolveScope(ctx, d, in.Namespace, "")
+		fmt.Fprintf(&b, "  scope: %s\n", pipelineScope.describe())
+		catalog, cerr := d.prom.metricCatalog(ctx, pipelineScope.matchers(), "24h")
 		if cerr != nil {
 			problems++
 			fmt.Fprintf(&b, "  query failed: %v\n", cerr)
@@ -774,6 +880,35 @@ func checkMetricsPipeline(ctx context.Context, d *deps, in nsInput) (string, err
 		b.WriteString(pipelineRemediation)
 	}
 	return b.String(), nil
+}
+
+// gatewayNamespaces lists the distinct namespaces holding gateways.
+func gatewayNamespaces(gws []apicastGateway) []string {
+	seen := map[string]bool{}
+	for _, g := range gws {
+		seen[g.Namespace] = true
+	}
+	return keysOf(seen)
+}
+
+// metricsPortServices returns the Services in ns that expose the APIcast
+// metrics port, with the port name a ServiceMonitor must reference.
+func metricsPortServices(ctx context.Context, d *deps, ns string) ([]string, error) {
+	svcs, err := d.kc.clientset.CoreV1().Services(ns).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for i := range svcs.Items {
+		svc := &svcs.Items[i]
+		for _, p := range svc.Spec.Ports {
+			if p.Port == 9421 || p.Name == "metrics" {
+				out = append(out, fmt.Sprintf("%s (port %d, name %q)", svc.Name, p.Port, p.Name))
+			}
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 func pipelineVerdict(problems int, uwmOK bool) string {

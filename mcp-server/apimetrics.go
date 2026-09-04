@@ -39,6 +39,7 @@ type deps struct {
 type metricScope struct {
 	Namespaces []string
 	Gateway    string // Deployment name, matched against the pod label
+	Origin     string // how Namespaces was decided, reported in every result
 }
 
 // matchers renders the scope as PromQL label matchers (without braces).
@@ -58,27 +59,44 @@ func (s metricScope) matchers() string {
 }
 
 func (s metricScope) describe() string {
+	var where string
 	switch {
-	case len(s.Namespaces) == 0 && s.Gateway == "":
-		return "all namespaces of the cluster"
-	case s.Gateway == "":
-		return "namespace(s) " + strings.Join(s.Namespaces, ", ")
 	case len(s.Namespaces) == 0:
-		return "gateway " + s.Gateway
+		where = "all namespaces of the cluster"
 	default:
-		return fmt.Sprintf("gateway %s in namespace(s) %s", s.Gateway, strings.Join(s.Namespaces, ", "))
+		where = "namespace(s) " + strings.Join(s.Namespaces, ", ")
 	}
+	if s.Gateway != "" {
+		where = "gateway " + s.Gateway + " in " + where
+	}
+	if s.Origin != "" {
+		where += " [" + s.Origin + "]"
+	}
+	return where
 }
 
-// scopeFor builds the query scope. An empty namespace means cluster-wide,
-// which is the right default when APIcast gateways are spread across
-// namespaces by the APIcast operator.
-func scopeFor(namespace, gateway string) metricScope {
-	sc := metricScope{Gateway: gateway}
+// resolveScope decides which namespaces a metric query covers.
+//
+// The default is the whole cluster. APIs are global objects in 3scale: a
+// product is served by whichever gateways are configured for it, in whatever
+// namespaces those live, so narrowing metric queries by namespace would hide
+// APIs rather than help find them. An explicit "namespace" argument narrows
+// deliberately.
+//
+// THREESCALE_NAMESPACE is NOT a metric filter. It identifies the API Manager
+// installation, and is used to reach the Admin Portal for product names and by
+// the installation tools; every metric report states both scopes so neither is
+// silently ignored.
+func resolveScope(ctx context.Context, d *deps, namespace, gateway string) metricScope {
 	if namespace != "" {
-		sc.Namespaces = []string{namespace}
+		return metricScope{Namespaces: []string{namespace}, Gateway: gateway, Origin: "namespace argument"}
 	}
-	return sc
+	return metricScope{Gateway: gateway, Origin: "cluster-wide: APIs are not confined to one namespace"}
+}
+
+// clusterScope is the unrestricted scope used to find an API wherever it is.
+func clusterScope(gateway string) metricScope {
+	return metricScope{Gateway: gateway, Origin: "cluster-wide lookup"}
 }
 
 // ---- parallel query helper ----
@@ -132,13 +150,13 @@ func (m metricAPI) label() string {
 
 // apisFromMetrics lists the APIs that produced traffic in the window.
 func apisFromMetrics(ctx context.Context, d *deps, sc metricScope, window string) ([]metricAPI, error) {
-	catalog, err := d.prom.metricCatalog(ctx)
+	catalog, err := d.prom.metricCatalog(ctx, sc.matchers(), window)
 	if err != nil {
 		return nil, err
 	}
 	name := metricName(catalog, "upstream_status")
 	if name == "" {
-		return nil, fmt.Errorf("no APIcast traffic metric (upstream_status) found in Prometheus — run check_metrics_pipeline to find out why")
+		return nil, fmt.Errorf("%s", explainNoMetrics(ctx, d, sc, window))
 	}
 	q := fmt.Sprintf("sum by (service_id, service_system_name, namespace) (increase(%s{%s}[%s]))",
 		name, sc.matchers(), window)
@@ -232,7 +250,11 @@ func resolveAPI(ctx context.Context, d *deps, query, namespace, window string, s
 		return nil, fmt.Errorf("'api' is required: pass the product name, its system name or its numeric service id")
 	}
 
-	metricAPIs, metricErr := apisFromMetrics(ctx, d, sc, window)
+	// The identity lookup is ALWAYS cluster-wide: an API is a 3scale product,
+	// not a namespaced object, and it is served by whichever gateways are
+	// configured for it. Narrowing this by namespace would report "no such
+	// API" for an API that plainly exists.
+	metricAPIs, metricErr := apisFromMetrics(ctx, d, clusterScope(sc.Gateway), window)
 	catalog, catalogEndpoint, catalogErr := d.admin.services(ctx, adminNamespace(ctx, d, namespace))
 
 	catalogNote := ""
@@ -269,7 +291,7 @@ func resolveAPI(ctx context.Context, d *deps, query, namespace, window string, s
 		}
 		hits = append(hits, resolvedAPI{
 			ID: m.ID, SystemName: m.SystemName, DisplayName: display,
-			MatchedBy: how, Namespaces: keysOf(m.Namespaces), HasTraffic: true,
+			MatchedBy: how + " (cluster-wide lookup)", Namespaces: keysOf(m.Namespaces), HasTraffic: true,
 		})
 	}
 
@@ -284,7 +306,14 @@ func resolveAPI(ctx context.Context, d *deps, query, namespace, window string, s
 	}
 
 	if len(hits) == 0 {
-		return nil, noAPIMatchError(query, metricAPIs, metricErr, catalog, catalogErr)
+		// Only worth the extra round-trip on the failure path.
+		var labelNames []string
+		if mcat, cerr := d.prom.metricCatalog(ctx, sc.matchers(), window); cerr == nil {
+			if m := metricName(mcat, "upstream_status"); m != "" {
+				labelNames, _ = d.prom.labelNames(ctx, []string{m}, time.Now().Add(-24*time.Hour), time.Now())
+			}
+		}
+		return nil, noAPIMatchError(query, metricAPIs, metricErr, catalog, catalogErr, labelNames)
 	}
 	// Prefer exact matches when several candidates survive.
 	var exact []resolvedAPI
@@ -323,7 +352,7 @@ func matchAPIIdentity(lowerQuery, id, sys, display string) (bool, string) {
 	return false, ""
 }
 
-func noAPIMatchError(query string, metricAPIs []metricAPI, metricErr error, catalog []apiService, catalogErr error) error {
+func noAPIMatchError(query string, metricAPIs []metricAPI, metricErr error, catalog []apiService, catalogErr error, labelNames []string) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "no API matching %q was found.\n", query)
 	if metricErr != nil {
@@ -337,9 +366,13 @@ func noAPIMatchError(query string, metricAPIs []metricAPI, metricErr error, cata
 	}
 	switch {
 	case len(metricAPIs) > 0 && labelled == 0:
-		b.WriteString("APIcast traffic metrics exist but carry no service_id/service_system_name labels: " +
-			"APICAST_EXTENDED_METRICS is not enabled on the gateways. Set it to \"true\" (APIcast CR spec, or the APIManager " +
-			"apicast staging/production spec) and per-API analysis becomes available. Run list_apicast_gateways to see which gateways are affected.\n")
+		b.WriteString("APIcast traffic metrics exist but carry no service_id/service_system_name labels.\n")
+		if len(labelNames) > 0 {
+			fmt.Fprintf(&b, "Labels actually present on the traffic metric: %s\n", strings.Join(labelNames, ", "))
+		}
+		b.WriteString("The usual cause is APICAST_EXTENDED_METRICS not being \"true\" on the gateways — set it (APIcast CR spec, " +
+			"or the APIManager apicast staging/production spec) and per-API analysis becomes available. " +
+			"Run 3scale_list_apicast_gateways to see which gateways are affected.\n")
 	case labelled > 0:
 		b.WriteString("APIs currently visible in metrics: ")
 		var names []string
@@ -684,4 +717,81 @@ func gatewayHealth(ctx context.Context, d *deps, namespaces []string) string {
 		}
 	}
 	return b.String()
+}
+
+// ---- self-diagnosis ----
+
+// explainNoMetrics turns "no data" into an actionable answer. Instead of
+// asserting that APIcast exports nothing, it reports the scope that was
+// queried, the query that was run, which metric names DO exist there, and
+// whether the per-API labels carry any values — which is enough to tell a
+// scoping mistake from a missing ServiceMonitor from disabled extended
+// metrics.
+func explainNoMetrics(ctx context.Context, d *deps, sc metricScope, window string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "no APIcast traffic metric (upstream_status) was found in the last %s.\n", window)
+	fmt.Fprintf(&b, "Scope queried: %s\n", sc.describe())
+	fmt.Fprintf(&b, "Probe: GET /api/v1/label/__name__/values?match[]={__name__=~\"upstream_status|...\"%s} over the last %s\n",
+		prefixComma(sc.matchers()), window)
+
+	// What metrics does this scope actually have?
+	if names, err := d.prom.metricNamesIn(ctx, sc.matchers(), window); err != nil {
+		fmt.Fprintf(&b, "Could not enumerate the metric names in this scope: %v\n", err)
+	} else if len(names) == 0 {
+		b.WriteString("\nNo gateway-like metric exists in this scope at all. Nothing is scraping APIcast:\n" +
+			"  - is user workload monitoring enabled on the cluster?\n" +
+			"  - is there a ServiceMonitor/PodMonitor in the gateway namespace, targeting the 9421 metrics port?\n" +
+			"  - does the gateway Service actually expose that port?\n" +
+			"Run 3scale_check_metrics_pipeline for a definitive answer.\n")
+	} else {
+		fmt.Fprintf(&b, "\nGateway-like metrics that DO exist in this scope: %s\n", strings.Join(names, ", "))
+		b.WriteString("The traffic counter is named differently than expected in this build of APIcast. " +
+			"Use 3scale_query_metrics with one of the names above to inspect it, and report the name so the tool can be taught it.\n")
+	}
+
+	// What labels does the traffic metric actually carry?
+	if names, err := d.prom.labelNames(ctx, nil, time.Now().Add(-24*time.Hour), time.Now()); err == nil && len(names) > 0 {
+		var svc []string
+		for _, n := range names {
+			if strings.Contains(n, "service") {
+				svc = append(svc, n)
+			}
+		}
+		if len(svc) > 0 {
+			fmt.Fprintf(&b, "Service-related label names present in Prometheus: %s\n", strings.Join(svc, ", "))
+		}
+	}
+
+	// Do the per-API labels carry anything, anywhere?
+	for _, label := range []string{"service_system_name", "service_id"} {
+		vals, err := d.prom.labelValues(ctx, label, nil, time.Now().Add(-24*time.Hour), time.Now())
+		if err != nil {
+			continue
+		}
+		if len(vals) == 0 {
+			fmt.Fprintf(&b, "The %s label has no values anywhere in the cluster over the last 24h: "+
+				"APICAST_EXTENDED_METRICS is not enabled on any gateway.\n", label)
+		} else {
+			fmt.Fprintf(&b, "The %s label does have values cluster-wide (%s), so extended metrics are on somewhere — "+
+				"the scope above is probably wrong. Retry with an explicit \"namespace\".\n",
+				label, strings.Join(truncateList(vals, 10), ", "))
+		}
+		break
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// prefixComma renders extra matchers inside a selector that already has one.
+func prefixComma(s string) string {
+	if s == "" {
+		return ""
+	}
+	return "," + s
+}
+
+func truncateList(in []string, n int) []string {
+	if len(in) <= n {
+		return in
+	}
+	return append(append([]string{}, in[:n]...), "…")
 }

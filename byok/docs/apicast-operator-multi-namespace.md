@@ -56,10 +56,15 @@ in that JSON.
   whole cluster: APIcast CRs, APIManager-managed gateways and any Deployment
   labelled or named `apicast`. It reports the namespace, the managing operator,
   readiness and the relevant `APICAST_*` settings for each.
-- **Metric queries are cluster-wide by default.** The metric tools accept an
-  optional `namespace` and `gateway` argument; without them they cover every
-  namespace, which is what you want when you do not yet know where the traffic
-  is being served.
+- **API and gateway lookups are cluster-wide, always.** The reference topology
+  is an APIManager in its own namespace and several self-managed gateways in
+  others; that APIManager namespace holds no gateway and produces no traffic
+  metrics. Searching for an API or a gateway is therefore never restricted by
+  namespace — including not by `THREESCALE_NAMESPACE`, which identifies the API
+  Manager rather than the gateways. Once an API is located, metric queries narrow
+  to the namespaces actually serving it and the result names them. A `namespace`
+  argument restricts deliberately, but if it matches nothing the tools widen the
+  search and say so, rather than reporting an API as absent.
 - **The same API can be served by several gateways.** The per-gateway table in
   `3scale_analyze_api_metrics` is what separates "the API is broken" from "one
   gateway is broken". Errors confined to a single namespace/deployment mean a
@@ -72,7 +77,9 @@ in that JSON.
 - **Monitoring is per namespace.** Each namespace holding gateways needs its own
   ServiceMonitor or PodMonitor; a gateway in a new namespace silently stops
   producing metrics until one is created there. That is the most common reason
-  an API "disappears" from `3scale_list_apis` after a migration.
+  an API "disappears" from `3scale_list_apis` after a migration. A ServiceMonitor
+  whose `port` does not exist on the gateway Service fails just as silently —
+  `3scale_check_metrics_pipeline` checks for that specifically.
 - **RBAC must be cluster-scoped.** The MCP server reads Deployments, pods, APIcast
   CRs, ServiceMonitors and metrics across namespaces; if a gateway namespace is
   missing from the report, suspect RBAC before concluding the gateway is absent.

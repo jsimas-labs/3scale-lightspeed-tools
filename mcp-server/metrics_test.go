@@ -335,3 +335,28 @@ func TestRenderGatewaysWarnsAboutMissingExtendedMetrics(t *testing.T) {
 		t.Errorf("empty discovery must explain itself:\n%s", empty)
 	}
 }
+
+// Removing the namespace matcher must leave valid PromQL: a naive replacement
+// produced "{,status=~\"5..\"}", which Prometheus rejects.
+func TestStripMatcherLeavesValidSelectors(t *testing.T) {
+	ns := `namespace=~"3scale"`
+	cases := map[string]string{
+		`sum(increase(upstream_status{namespace=~"3scale",status=~"5.."}[1h]))`: `sum(increase(upstream_status{status=~"5.."}[1h]))`,
+		`sum(increase(upstream_status{status=~"5..",namespace=~"3scale"}[1h]))`: `sum(increase(upstream_status{status=~"5.."}[1h]))`,
+		`sum(increase(upstream_status{namespace=~"3scale"}[1h]))`:               `sum(increase(upstream_status{}[1h]))`,
+		`min by (dict) (a{namespace=~"3scale"} / b{namespace=~"3scale"})`:       `min by (dict) (a{} / b{})`,
+	}
+	for in, want := range cases {
+		if got := stripMatcher(in, ns); got != want {
+			t.Errorf("stripMatcher(%q)\n = %q\nwant %q", in, got, want)
+		}
+	}
+	for _, got := range cases {
+		if strings.Contains(got, "{,") || strings.Contains(got, ",}") || strings.Contains(got, ",,") {
+			t.Errorf("dangling comma in %q", got)
+		}
+	}
+	if got := stripMatcher(`up{job="x"}`, ""); got != `up{job="x"}` {
+		t.Errorf("an empty matcher must be a no-op, got %q", got)
+	}
+}

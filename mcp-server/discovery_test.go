@@ -114,3 +114,68 @@ func TestDiscoverGatewaysDeduplicates(t *testing.T) {
 		t.Fatalf("got %d gateways, want 1", len(gws))
 	}
 }
+
+// An API is a 3scale product served by whichever gateways are configured for
+// it, so metric lookups must never be narrowed by namespace unless the caller
+// asks: filtering by THREESCALE_NAMESPACE hid APIs that plainly existed.
+func TestResolveScopeIsClusterWideByDefault(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		apicastDeployment("team-a", "apicast-team-a", map[string]string{"app": "apicast"}, nil))
+	d := &deps{kc: &k8sClients{clientset: cs, defaultNamespace: "my-3scale"}}
+
+	sc := resolveScope(context.Background(), d, "", "")
+	if len(sc.Namespaces) != 0 {
+		t.Fatalf("scope = %v, want no namespace filter", sc.Namespaces)
+	}
+	if sc.matchers() != "" {
+		t.Errorf("no namespace matcher may be emitted, got %q", sc.matchers())
+	}
+	if !strings.Contains(sc.describe(), "cluster-wide") {
+		t.Errorf("the report must state the scope, got %q", sc.describe())
+	}
+}
+
+// THREESCALE_NAMESPACE still has a job: it identifies the API Manager whose
+// Admin Portal supplies product display names.
+func TestConfiguredNamespaceDrivesTheProductCatalogNotTheMetricFilter(t *testing.T) {
+	d := &deps{
+		kc:    &k8sClients{clientset: fake.NewSimpleClientset(), defaultNamespace: "my-3scale"},
+		admin: newAdminClient(nil, "", "", false, true),
+	}
+	if got := adminNamespace(context.Background(), d, ""); got != "my-3scale" {
+		t.Errorf("the Admin API lookup must use THREESCALE_NAMESPACE, got %q", got)
+	}
+	if got := adminNamespace(context.Background(), d, "other"); got != "other" {
+		t.Errorf("an explicit namespace must win, got %q", got)
+	}
+}
+
+func TestResolveScopeExplicitArgumentWins(t *testing.T) {
+	cs := fake.NewSimpleClientset(
+		apicastDeployment("team-a", "apicast-team-a", map[string]string{"app": "apicast"}, nil))
+	d := &deps{kc: &k8sClients{clientset: cs, defaultNamespace: "my-3scale"}}
+
+	sc := resolveScope(context.Background(), d, "team-a", "apicast-team-a")
+	if len(sc.Namespaces) != 1 || sc.Namespaces[0] != "team-a" {
+		t.Fatalf("an explicit namespace must win, got %v", sc.Namespaces)
+	}
+	if !strings.Contains(sc.matchers(), `pod=~"apicast-team-a-.*"`) {
+		t.Errorf("the gateway filter was lost: %q", sc.matchers())
+	}
+}
+
+// Only when nothing is configured and nothing is discovered may the query be
+// unscoped — and the result has to admit it.
+func TestResolveScopeFallsBackToClusterWide(t *testing.T) {
+	d := &deps{kc: &k8sClients{clientset: fake.NewSimpleClientset(), defaultNamespace: ""}}
+	sc := resolveScope(context.Background(), d, "", "")
+	if len(sc.Namespaces) != 0 {
+		t.Fatalf("expected an unscoped query, got %v", sc.Namespaces)
+	}
+	if sc.matchers() != "" {
+		t.Errorf("an unscoped query must produce no namespace matcher, got %q", sc.matchers())
+	}
+	if !strings.Contains(sc.describe(), "cluster-wide") {
+		t.Errorf("the fallback must be stated in the output, got %q", sc.describe())
+	}
+}

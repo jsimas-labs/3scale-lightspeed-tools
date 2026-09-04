@@ -21,23 +21,26 @@ import (
 
 const (
 	serverName    = "3scale-troubleshoot"
-	serverVersion = "2.0.0"
+	serverVersion = "2.3.0"
 )
 
 const serverInstructions = `Read-only troubleshooting tools for Red Hat 3scale API Management on OpenShift, including per-API traffic analysis from APIcast metrics.
 
 All tools are prefixed with 3scale_.
 
-Where things live:
-- The API Manager (system, backend, zync, apicast-staging, apicast-production) lives in one namespace, by default the one this server was configured with.
-- APIcast gateways are NOT limited to that namespace: the APIcast operator can deploy self-managed gateways (kind APIcast, apps.3scale.net/v1alpha1) in any namespace. Metric tools therefore search the whole cluster unless a namespace is given.
+Where things live (READ THIS BEFORE PASSING A NAMESPACE):
+- The API Manager (system, backend, zync) lives in one namespace, by default the one this server was configured with (THREESCALE_NAMESPACE).
+- The APIcast gateways serving traffic are frequently NOT in that namespace. A very common install has the APIManager in one namespace and several self-managed APIcast gateways, deployed by the APIcast operator, each in its own namespace.
+- Therefore do NOT pass "namespace" to metric or gateway tools hoping to find an API or a gateway: they search the whole cluster by default. Passing the APIManager namespace is the most common way to get an empty result. The tools now widen the search and say so when it happens, but it is still noise.
+- APIcast gateways are NOT limited to that namespace: the APIcast operator can deploy self-managed gateways (kind APIcast, apps.3scale.net/v1alpha1) in any namespace.
+- APIs are 3scale products, not namespaced objects: an API is found CLUSTER-WIDE, never filtered by namespace. THREESCALE_NAMESPACE identifies the API Manager and is used to reach its Admin Portal for product names and by the installation tools; it is NOT a metric filter. Pass "namespace" only to narrow deliberately. Every metric result states the scope it used, and once an API is located the analysis narrows to the namespaces actually serving it.
 
 Choosing a tool:
 1. "Why is API X failing / slow / returning errors?" -> 3scale_analyze_api_metrics with the product name, system name or service id. It resolves the API, breaks traffic down by HTTP status code, compares upstream and total latency, and reports probable causes.
 2. "Which APIs exist / which one is unhealthy?" -> 3scale_list_apis, then drill into the worst.
 3. "How is the gateway fleet doing?" -> 3scale_traffic_overview.
 4. "Where are the gateways and how are they configured?" -> 3scale_list_apicast_gateways.
-5. A metrics tool returned no data -> 3scale_check_metrics_pipeline; the usual causes are user workload monitoring being disabled, a missing ServiceMonitor, or APICAST_EXTENDED_METRICS not being true (without it, metrics carry no per-API labels).
+5. A metrics tool returned no data -> read the diagnosis it printed: it names the scope queried, the PromQL probe, which gateway metrics DO exist there, and whether the per-API labels have values anywhere. Then 3scale_check_metrics_pipeline; the usual causes are user workload monitoring being disabled, a ServiceMonitor missing or pointing at a port the Service does not expose, or APICAST_EXTENDED_METRICS not being true (without it, metrics carry no per-API labels).
 6. Installation health -> 3scale_diagnose, then 3scale_list_pods, 3scale_get_deployments, 3scale_get_events, 3scale_get_pod_logs, 3scale_check_routes, 3scale_check_pvcs.
 7. Database problems -> 3scale_check_database_config: since 3scale 2.16 the Redis databases (and usually the system RDBMS) are EXTERNAL, configured through the backend-redis, system-redis, system-database and zync secrets — do not assume database pods exist in the namespace.
 8. Anything the dedicated tools do not cover -> 3scale_query_metrics with raw PromQL.

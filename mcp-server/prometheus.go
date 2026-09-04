@@ -46,10 +46,14 @@ type promClient struct {
 	token   string // static token; when empty the ServiceAccount token file is read per request
 	http    *http.Client
 
-	mu         sync.Mutex
-	catalog    map[string]bool
-	catalogAt  time.Time
-	catalogErr error
+	mu      sync.Mutex
+	catalog map[string]catalogEntry // keyed by scope selector + window
+}
+
+// catalogEntry is a cached, successful metric-name probe.
+type catalogEntry struct {
+	names map[string]bool
+	at    time.Time
 }
 
 func newPromClient(baseURL, token string, insecure bool) *promClient {
@@ -327,31 +331,100 @@ func catalogNames() []string {
 	return names
 }
 
-// metricCatalog returns the set of APIcast metric names actually present in
-// Prometheus. One instant query answers "are APIcast metrics being scraped at
-// all?" and "which exposition naming is in use?".
-func (p *promClient) metricCatalog(ctx context.Context) (map[string]bool, error) {
+// metricCatalog returns the set of APIcast metric names actually present, for
+// the given scope and time window.
+//
+// The window matters: a bare instant query only looks back 5 minutes, so a
+// gateway that served traffic an hour ago would look as if it exported no
+// metrics at all and every analysis would report "no data". count_over_time
+// asks the question over the same window the caller is analysing.
+func (p *promClient) metricCatalog(ctx context.Context, selector, window string) (map[string]bool, error) {
+	key := selector + "|" + window
 	p.mu.Lock()
-	if p.catalog != nil && time.Since(p.catalogAt) < metricCatalogTTL {
-		c, err := p.catalog, p.catalogErr
+	if c, ok := p.catalog[key]; ok && time.Since(c.at) < metricCatalogTTL {
 		p.mu.Unlock()
-		return c, err
+		return c.names, nil
 	}
 	p.mu.Unlock()
 
-	query := fmt.Sprintf("count by (__name__) ({__name__=~%q})", strings.Join(catalogNames(), "|"))
-	samples, err := p.instant(ctx, query, time.Time{})
-	catalog := map[string]bool{}
-	for _, s := range samples {
-		if n := s.label("__name__"); n != "" {
-			catalog[n] = true
+	match := seriesSelector(fmt.Sprintf("__name__=~%q", strings.Join(catalogNames(), "|")), selector)
+	found, err := p.metricNamesMatching(ctx, match, window)
+	if err != nil {
+		return nil, err
+	}
+	names := map[string]bool{}
+	for _, n := range found {
+		names[n] = true
+	}
+	// Only a positive result is cached: an empty catalog usually means the
+	// pipeline is still being fixed, and the next call must see the change.
+	if len(names) > 0 {
+		p.mu.Lock()
+		if p.catalog == nil {
+			p.catalog = map[string]catalogEntry{}
+		}
+		p.catalog[key] = catalogEntry{names: names, at: time.Now()}
+		p.mu.Unlock()
+	}
+	return names, nil
+}
+
+// metricNamesMatching lists the metric names present over a window.
+//
+// It deliberately uses the label-values metadata endpoint rather than an
+// instant query. A query would have to wrap the selector in a range function
+// to honour the window, and every *_over_time and rate/increase function
+// DROPS __name__ — so a multi-metric selector collapses series that differ
+// only by metric name (openresty_shdict_capacity vs _free_space, or
+// _sum vs _count of a histogram) into the same labelset, and Prometheus
+// rejects the whole query with "vector cannot contain metrics with the same
+// labelset". The metadata endpoint answers the same question directly, over
+// an explicit time range, and cannot collide.
+func (p *promClient) metricNamesMatching(ctx context.Context, match, window string) ([]string, error) {
+	dur, _, err := parseWindow(window)
+	if err != nil {
+		return nil, err
+	}
+	end := time.Now()
+	return p.labelValues(ctx, "__name__", []string{match}, end.Add(-dur), end)
+}
+
+// metricNamesIn lists every metric name present in a scope, filtered to those
+// that plausibly come from APIcast. It answers "what IS being scraped here?"
+// when the expected names are absent, which is the difference between a dead
+// end and an actionable answer.
+func (p *promClient) metricNamesIn(ctx context.Context, selector, window string) ([]string, error) {
+	if strings.TrimSpace(selector) == "" {
+		return nil, fmt.Errorf("a namespace scope is required to enumerate metric names")
+	}
+	all, err := p.metricNamesMatching(ctx, seriesSelector(selector), window)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, n := range all {
+		if looksLikeAPIcastMetric(n) {
+			out = append(out, n)
 		}
 	}
+	sort.Strings(out)
+	return out, nil
+}
 
-	p.mu.Lock()
-	p.catalog, p.catalogAt, p.catalogErr = catalog, time.Now(), err
-	p.mu.Unlock()
-	return catalog, err
+// seriesSelector builds a {..} series selector from matcher fragments.
+func seriesSelector(parts ...string) string {
+	return "{" + joinSelectors(parts...) + "}"
+}
+
+// looksLikeAPIcastMetric keeps the gateway's own metrics and drops the
+// kubelet/cAdvisor series that exist in every namespace.
+func looksLikeAPIcastMetric(name string) bool {
+	for _, frag := range []string{"upstream", "response_time", "threescale", "apicast", "nginx", "openresty", "batching"} {
+		if strings.Contains(name, frag) {
+			return true
+		}
+	}
+	return false
 }
 
 // metricName resolves a logical metric to the exposition name present in this
@@ -389,6 +462,33 @@ func (p *promClient) labelValues(ctx context.Context, label string, matches []st
 	}
 	sort.Strings(values)
 	return values, nil
+}
+
+// labelNames returns the label names carried by the series matching the given
+// selectors. When the expected service_id/service_system_name labels are
+// missing this says what the metric actually carries, which distinguishes
+// "extended metrics are off" from "this build names the labels differently".
+func (p *promClient) labelNames(ctx context.Context, matches []string, start, end time.Time) ([]string, error) {
+	params := url.Values{}
+	for _, m := range matches {
+		params.Add("match[]", m)
+	}
+	if !start.IsZero() {
+		params.Set("start", strconv.FormatInt(start.Unix(), 10))
+	}
+	if !end.IsZero() {
+		params.Set("end", strconv.FormatInt(end.Unix(), 10))
+	}
+	pr, err := p.do(ctx, http.MethodGet, "/api/v1/labels", params)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	if err := json.Unmarshal(pr.Data, &names); err != nil {
+		return nil, fmt.Errorf("decoding label names: %w", err)
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 // ---- helpers ----

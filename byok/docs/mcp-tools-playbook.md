@@ -56,11 +56,23 @@ gateway, suspect that deployment.
 
 ### "I get no metrics"
 
-`3scale_check_metrics_pipeline`. It checks, in order: gateways found and their
-`APICAST_EXTENDED_METRICS` setting, ServiceMonitors/PodMonitors, user workload
+First read the diagnosis the empty result already printed: it names the scope
+queried, the exact PromQL probe, which gateway-like metrics *do* exist in that
+scope, and whether `service_id`/`service_system_name` carry values anywhere in
+the cluster. That usually identifies the cause on its own:
+
+- gateway metrics exist but not the expected traffic counter → the metric is
+  named differently in that APIcast build; inspect it with `3scale_query_metrics`;
+- no gateway metric at all in the scope → nothing is scraping APIcast;
+- the service labels have values elsewhere but not here → the scope is wrong;
+  retry with an explicit `namespace`.
+
+Then run `3scale_check_metrics_pipeline`, which checks in order: gateways found
+and their `APICAST_EXTENDED_METRICS` setting, ServiceMonitors/PodMonitors,
+whether a Service actually exposes port 9421 for them to scrape, user workload
 monitoring, Prometheus reachability, which APIcast metrics exist, whether the
 per-API labels have values, and scrape target health. It returns the exact YAML
-to apply. Do not guess before running it.
+to apply.
 
 ### "Where is my gateway?"
 
@@ -72,6 +84,16 @@ APIManager: see `apicast-operator-multi-namespace.md`.
 - **Windows.** Metric tools take `window` (`15m`, `1h`, `24h`, `7d`, default
   `1h`). Counts are `increase()` over that window, so they are totals for the
   period, not instantaneous rates. Widen the window when traffic is low.
+- **Scope: do not pass a namespace.** In the common install the APIManager is
+  in one namespace and the APIcast gateways — deployed by the APIcast operator —
+  are in others, one per team or environment. The APIManager namespace therefore
+  contains **no gateway and no traffic metrics at all**. Metric and gateway
+  tools search the whole cluster by default; passing `namespace` is the most
+  common way to get an empty answer. The tools widen the search automatically
+  and say when they did, but the argument is still only for restricting
+  deliberately. `THREESCALE_NAMESPACE` identifies the API Manager (used for
+  Admin Portal product names and the installation tools), never the metric
+  scope. Every result states the scope it used — read that line first.
 - **`<unlabelled>` in `3scale_list_apis`** means traffic from a gateway running
   without `APICAST_EXTENDED_METRICS=true`. That traffic exists but cannot be
   attributed to an API.

@@ -65,9 +65,24 @@ All tools are prefixed with `3scale_` and are strictly read-only.
 | `3scale_check_pvcs` | PVCs with phase, capacity, and storage class |
 
 The installation tools accept an optional `namespace` defaulting to
-`THREESCALE_NAMESPACE` (default `3scale`). The metric tools search **every**
-namespace unless `namespace` (and optionally `gateway`) is given, and accept a
+`THREESCALE_NAMESPACE` (default `3scale`).
+
+The metric tools accept the same `namespace` (plus an optional `gateway`) and a
 `window` such as `15m`, `1h`, `24h` or `7d` (default `1h`).
+
+**APIs and gateways are looked up cluster-wide and are never hidden by a
+namespace argument.** The reference install has the APIManager in one namespace
+and self-managed APIcast gateways — created by the APIcast operator — in others;
+the APIManager namespace then holds no gateway and no traffic metrics at all.
+Narrowing the search by namespace would report a perfectly healthy API as
+missing. Once the API is located, metric queries narrow to the namespaces
+actually serving it and the report names them. A `namespace` argument restricts
+deliberately, but when it matches nothing the tools widen the search and say so
+rather than returning zeros.
+
+`THREESCALE_NAMESPACE` is therefore **not** a metric filter: it identifies the
+API Manager, and is used to reach its Admin Portal for product display names and
+by the installation tools.
 
 ### Requirements for per-API metrics
 

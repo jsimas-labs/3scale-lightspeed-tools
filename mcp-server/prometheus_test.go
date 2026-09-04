@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,11 +16,12 @@ import (
 type fakeProm struct {
 	*httptest.Server
 	lastQuery map[string]string
+	lastMatch map[string]string
 }
 
 func newFakeProm(t *testing.T, handler func(path string, form map[string]string) (any, int)) *fakeProm {
 	t.Helper()
-	f := &fakeProm{lastQuery: map[string]string{}}
+	f := &fakeProm{lastQuery: map[string]string{}, lastMatch: map[string]string{}}
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
 		form := map[string]string{}
@@ -27,6 +29,12 @@ func newFakeProm(t *testing.T, handler func(path string, form map[string]string)
 			form[k] = v[0]
 		}
 		f.lastQuery[r.URL.Path] = form["query"]
+		if m := r.Form["match[]"]; len(m) > 0 {
+			f.lastMatch[r.URL.Path] = m[0]
+		}
+		if m := r.Form["match[]"]; len(m) > 0 {
+			form["match[]"] = m[0]
+		}
 		body, code := handler(r.URL.Path, form)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
@@ -34,6 +42,11 @@ func newFakeProm(t *testing.T, handler func(path string, form map[string]string)
 	}))
 	t.Cleanup(f.Close)
 	return f
+}
+
+// labelValues is the shape the /api/v1/label/<l>/values endpoint returns.
+func labelValues(names ...string) map[string]any {
+	return map[string]any{"status": "success", "data": names}
 }
 
 func vector(entries ...map[string]any) map[string]any {
@@ -109,30 +122,32 @@ func TestPromRangeQuery(t *testing.T) {
 
 func TestMetricCatalogIsCachedAndDetectsNames(t *testing.T) {
 	calls := 0
-	f := newFakeProm(t, func(string, map[string]string) (any, int) {
+	f := newFakeProm(t, func(path string, form map[string]string) (any, int) {
 		calls++
-		return vector(
-			vecEntry(map[string]string{"__name__": "upstream_status"}, "12"),
-			vecEntry(map[string]string{"__name__": "total_response_time_seconds_bucket"}, "40"),
-		), http.StatusOK
+		return map[string]any{"status": "success",
+			"data": []string{"upstream_status", "total_response_time_seconds_bucket"}}, http.StatusOK
 	})
 	p := newPromClient(f.URL, "", false)
 	ctx := context.Background()
-	catalog, err := p.metricCatalog(ctx)
+	catalog, err := p.metricCatalog(ctx, `namespace=~"3scale"`, "1h")
 	if err != nil {
 		t.Fatalf("metricCatalog: %v", err)
 	}
 	if !catalog["upstream_status"] || catalog["threescale_backend_calls"] {
 		t.Errorf("unexpected catalog: %v", catalog)
 	}
-	if _, err := p.metricCatalog(ctx); err != nil {
+	if _, err := p.metricCatalog(ctx, `namespace=~"3scale"`, "1h"); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 1 {
 		t.Errorf("the catalog should be cached, Prometheus was queried %d times", calls)
 	}
-	if q := f.lastQuery["/api/v1/query"]; !strings.Contains(q, "__name__=~") {
-		t.Errorf("the catalog probe should be a single __name__ query, got %q", q)
+	m := f.lastMatch["/api/v1/label/__name__/values"]
+	if !strings.Contains(m, "__name__=~") {
+		t.Errorf("the catalog probe should select by __name__, got %q", m)
+	}
+	if !strings.Contains(m, `namespace=~"3scale"`) {
+		t.Errorf("the catalog probe must be scoped to the namespaces, got %q", m)
 	}
 }
 
@@ -149,9 +164,10 @@ func TestPromDisabledWhenNoURL(t *testing.T) {
 func TestListAPIsBuildsPerServiceQueries(t *testing.T) {
 	f := newFakeProm(t, func(path string, form map[string]string) (any, int) {
 		q := form["query"]
+		if strings.HasPrefix(path, "/api/v1/label/") {
+			return labelValues("upstream_status"), http.StatusOK
+		}
 		switch {
-		case strings.Contains(q, "__name__"):
-			return vector(vecEntry(map[string]string{"__name__": "upstream_status"}, "1")), http.StatusOK
 		case strings.Contains(q, `status=~"5.."`):
 			return vector(vecEntry(map[string]string{"service_id": "2", "service_system_name": "echo"}, "5")), http.StatusOK
 		case strings.Contains(q, `status=~"4.."`):
@@ -231,6 +247,10 @@ func TestLabelValuesUsesGetAndDecodesArray(t *testing.T) {
 func TestAnalyzeAPIProducesAFullReport(t *testing.T) {
 	f := newFakeProm(t, func(path string, form map[string]string) (any, int) {
 		q := form["query"]
+		if strings.HasPrefix(path, "/api/v1/label/") {
+			return labelValues("upstream_status", "total_response_time_seconds_bucket",
+				"upstream_response_time_seconds_bucket", "threescale_backend_calls"), http.StatusOK
+		}
 		if path == "/api/v1/query_range" {
 			return map[string]any{"status": "success", "data": map[string]any{
 				"resultType": "matrix",
@@ -241,13 +261,6 @@ func TestAnalyzeAPIProducesAFullReport(t *testing.T) {
 			}}, http.StatusOK
 		}
 		switch {
-		case strings.Contains(q, "__name__"):
-			return vector(
-				vecEntry(map[string]string{"__name__": "upstream_status"}, "1"),
-				vecEntry(map[string]string{"__name__": "total_response_time_seconds_bucket"}, "1"),
-				vecEntry(map[string]string{"__name__": "upstream_response_time_seconds_bucket"}, "1"),
-				vecEntry(map[string]string{"__name__": "threescale_backend_calls"}, "1"),
-			), http.StatusOK
 		case strings.Contains(q, "histogram_quantile(0.95") && strings.Contains(q, "total_response_time"):
 			return vector(vecEntry(nil, "0.4")), http.StatusOK
 		case strings.Contains(q, "histogram_quantile(0.95") && strings.Contains(q, "upstream_response_time"):
@@ -303,9 +316,8 @@ func TestAnalyzeAPIProducesAFullReport(t *testing.T) {
 
 func TestAnalyzeAPIUnknownAPIExplainsWhatIsAvailable(t *testing.T) {
 	f := newFakeProm(t, func(path string, form map[string]string) (any, int) {
-		q := form["query"]
-		if strings.Contains(q, "__name__") {
-			return vector(vecEntry(map[string]string{"__name__": "upstream_status"}, "1")), http.StatusOK
+		if strings.HasPrefix(path, "/api/v1/label/") {
+			return labelValues("upstream_status"), http.StatusOK
 		}
 		return vector(vecEntry(map[string]string{"service_id": "7", "service_system_name": "echo_api"}, "10")), http.StatusOK
 	})
@@ -320,5 +332,314 @@ func TestAnalyzeAPIUnknownAPIExplainsWhatIsAvailable(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "echo_api") {
 		t.Errorf("the error should list the APIs that do exist: %v", err)
+	}
+}
+
+// A gateway that served traffic earlier in the window but nothing in the last
+// five minutes must still be found: the old instant-query probe reported "no
+// metrics" in that very common case.
+func TestCatalogProbeSpansTheWindowNotTheLastFiveMinutes(t *testing.T) {
+	var start, end string
+	f := newFakeProm(t, func(_ string, form map[string]string) (any, int) {
+		start, end = form["start"], form["end"]
+		return map[string]any{"status": "success", "data": []string{"upstream_status"}}, http.StatusOK
+	})
+	p := newPromClient(f.URL, "", false)
+	catalog, err := p.metricCatalog(context.Background(), `namespace=~"3scale"`, "24h")
+	if err != nil {
+		t.Fatalf("metricCatalog: %v", err)
+	}
+	if !catalog["upstream_status"] {
+		t.Fatal("the metric was not found")
+	}
+	s0, e0 := mustAtoi(t, start), mustAtoi(t, end)
+	if span := e0 - s0; span < 23*3600 || span > 25*3600 {
+		t.Errorf("the probe must span the 24h window, got %ds", span)
+	}
+}
+
+func mustAtoi(t *testing.T, s string) int64 {
+	t.Helper()
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		t.Fatalf("bad timestamp %q: %v", s, err)
+	}
+	return v
+}
+
+// A multi-metric selector must never be wrapped in a range function: those
+// drop __name__, so series differing only by metric name collide and
+// Prometheus rejects the query with "vector cannot contain metrics with the
+// same labelset".
+func TestCatalogProbeNeverUsesARangeFunction(t *testing.T) {
+	f := newFakeProm(t, func(path string, form map[string]string) (any, int) {
+		if path == "/api/v1/query" {
+			t.Errorf("the catalog probe must not run an instant query: %q", form["query"])
+		}
+		return map[string]any{"status": "success", "data": []string{"upstream_status"}}, http.StatusOK
+	})
+	p := newPromClient(f.URL, "", false)
+	if _, err := p.metricCatalog(context.Background(), "", "1h"); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"count_over_time", "increase(", "rate("} {
+		if strings.Contains(f.lastMatch["/api/v1/label/__name__/values"], bad) {
+			t.Errorf("the probe must not use %s", bad)
+		}
+	}
+}
+
+// An empty catalog must not be cached: the operator fixes the pipeline and
+// retries immediately, and a poisoned cache would keep saying "no metrics".
+func TestEmptyCatalogIsNotCached(t *testing.T) {
+	calls := 0
+	f := newFakeProm(t, func(string, map[string]string) (any, int) {
+		calls++
+		if calls == 1 {
+			return map[string]any{"status": "success", "data": []string{}}, http.StatusOK
+		}
+		return map[string]any{"status": "success", "data": []string{"upstream_status"}}, http.StatusOK
+	})
+	p := newPromClient(f.URL, "", false)
+	ctx := context.Background()
+	if c, _ := p.metricCatalog(ctx, "", "1h"); len(c) != 0 {
+		t.Fatal("expected an empty first catalog")
+	}
+	c, err := p.metricCatalog(ctx, "", "1h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c["upstream_status"] {
+		t.Errorf("the second call must re-probe rather than serve an empty cache (calls=%d)", calls)
+	}
+}
+
+// Errors must not be cached either.
+func TestCatalogErrorIsNotCached(t *testing.T) {
+	calls := 0
+	f := newFakeProm(t, func(string, map[string]string) (any, int) {
+		calls++
+		if calls == 1 {
+			return map[string]any{"status": "error", "error": "transient"}, http.StatusServiceUnavailable
+		}
+		return map[string]any{"status": "success", "data": []string{"upstream_status"}}, http.StatusOK
+	})
+	p := newPromClient(f.URL, "", false)
+	ctx := context.Background()
+	if _, err := p.metricCatalog(ctx, "", "1h"); err == nil {
+		t.Fatal("expected the first probe to fail")
+	}
+	if c, err := p.metricCatalog(ctx, "", "1h"); err != nil || !c["upstream_status"] {
+		t.Errorf("a transient failure must not poison the cache: %v %v", c, err)
+	}
+}
+
+// When the expected metric is absent, the tool must report what IS there
+// rather than dead-ending.
+func TestExplainNoMetricsReportsWhatExists(t *testing.T) {
+	f := newFakeProm(t, func(path string, form map[string]string) (any, int) {
+		if path == "/api/v1/label/__name__/values" {
+			m := form["match[]"]
+			if strings.Contains(m, "__name__=~") {
+				return labelValues(), http.StatusOK // none of the expected names
+			}
+			return labelValues("nginx_http_connections", "container_cpu_usage_seconds_total"), http.StatusOK
+		}
+		if strings.HasPrefix(path, "/api/v1/label/") {
+			return labelValues(), http.StatusOK
+		}
+		return vector(), http.StatusOK
+	})
+	d := &deps{
+		kc:   &k8sClients{clientset: nil, defaultNamespace: "3scale"},
+		prom: newPromClient(f.URL, "", false),
+	}
+	sc := metricScope{Namespaces: []string{"3scale"}, Origin: "THREESCALE_NAMESPACE=3scale"}
+	out := explainNoMetrics(context.Background(), d, sc, "1h")
+
+	if !strings.Contains(out, "THREESCALE_NAMESPACE=3scale") {
+		t.Errorf("the scope actually queried must be reported:\n%s", out)
+	}
+	if !strings.Contains(out, "nginx_http_connections") {
+		t.Errorf("gateway metrics that do exist must be listed:\n%s", out)
+	}
+	if strings.Contains(out, "container_cpu_usage_seconds_total") {
+		t.Errorf("unrelated kubelet metrics must be filtered out:\n%s", out)
+	}
+}
+
+func TestLooksLikeAPIcastMetric(t *testing.T) {
+	for _, in := range []string{"upstream_status", "total_response_time_seconds_bucket", "threescale_backend_calls", "nginx_error_log", "openresty_shdict_capacity"} {
+		if !looksLikeAPIcastMetric(in) {
+			t.Errorf("%q should be recognised as a gateway metric", in)
+		}
+	}
+	for _, in := range []string{"container_memory_usage_bytes", "kube_pod_info", "up"} {
+		if looksLikeAPIcastMetric(in) {
+			t.Errorf("%q should not be recognised as a gateway metric", in)
+		}
+	}
+}
+
+// When traffic exists but carries no service labels, the error must say which
+// labels the metric really has — that is what distinguishes "extended metrics
+// off" from "this build labels services differently".
+func TestNoAPIMatchReportsActualLabelNames(t *testing.T) {
+	err := noAPIMatchError("payments",
+		[]metricAPI{{Requests: 500}}, // traffic, but no id/system name
+		nil, nil, nil,
+		[]string{"container", "endpoint", "namespace", "pod", "status"})
+	msg := err.Error()
+	if !strings.Contains(msg, "APICAST_EXTENDED_METRICS") {
+		t.Errorf("the likely cause must be named:\n%s", msg)
+	}
+	if !strings.Contains(msg, "status") || !strings.Contains(msg, "pod") {
+		t.Errorf("the labels actually present must be listed:\n%s", msg)
+	}
+}
+
+func TestLabelNamesEndpoint(t *testing.T) {
+	var path, method string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path, method = r.URL.Path, r.Method
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":["status","namespace","service_id"]}`))
+	}))
+	defer srv.Close()
+	p := newPromClient(srv.URL, "", false)
+	names, err := p.labelNames(context.Background(), []string{"upstream_status"}, time.Time{}, time.Time{})
+	if err != nil {
+		t.Fatalf("labelNames: %v", err)
+	}
+	if len(names) != 3 || names[0] != "namespace" {
+		t.Errorf("names = %v (must be sorted)", names)
+	}
+	if path != "/api/v1/labels" || method != http.MethodGet {
+		t.Errorf("unexpected request %s %s", method, path)
+	}
+}
+
+// Regression: the catalog probe once wrapped a multi-metric selector in
+// count_over_time, which drops __name__ and made Prometheus reject the query
+// with "vector cannot contain metrics with the same labelset" — breaking every
+// metric tool. Reproduce the server behaviour and assert we no longer trip it.
+func TestCatalogProbeAvoidsDuplicateLabelsetError(t *testing.T) {
+	f := newFakeProm(t, func(path string, form map[string]string) (any, int) {
+		if path == "/api/v1/query" {
+			q := form["query"]
+			// Emulate Prometheus: a range function over a multi-metric
+			// selector collapses openresty_shdict_capacity and
+			// _free_space onto the same labelset.
+			for _, fn := range []string{"count_over_time", "increase(", "rate("} {
+				if strings.Contains(q, fn) && strings.Contains(q, "__name__=~") {
+					return map[string]any{"status": "error", "errorType": "execution",
+						"error": "vector cannot contain metrics with the same labelset"}, http.StatusUnprocessableEntity
+				}
+			}
+			return vector(), http.StatusOK
+		}
+		return labelValues("upstream_status", "openresty_shdict_capacity", "openresty_shdict_free_space"), http.StatusOK
+	})
+	p := newPromClient(f.URL, "", false)
+	catalog, err := p.metricCatalog(context.Background(), `namespace=~"3scale"`, "1h")
+	if err != nil {
+		t.Fatalf("the catalog probe must not trip the duplicate-labelset error: %v", err)
+	}
+	if !catalog["upstream_status"] {
+		t.Errorf("catalog = %v", catalog)
+	}
+}
+
+// An API served from a namespace other than THREESCALE_NAMESPACE must still be
+// found: the lookup is cluster-wide, and the analysis then narrows to where the
+// traffic actually is.
+func TestAnalyzeAPIFindsAPIOutsideTheConfiguredNamespace(t *testing.T) {
+	var sawNamespaceFilterDuringLookup bool
+	f := newFakeProm(t, func(path string, form map[string]string) (any, int) {
+		q := form["query"]
+		if strings.HasPrefix(path, "/api/v1/label/") {
+			return labelValues("upstream_status"), http.StatusOK
+		}
+		if path == "/api/v1/query_range" {
+			return map[string]any{"status": "success", "data": map[string]any{"resultType": "matrix", "result": []any{}}}, http.StatusOK
+		}
+		if strings.Contains(q, "sum by (service_id, service_system_name, namespace)") {
+			if strings.Contains(q, "namespace=~") {
+				sawNamespaceFilterDuringLookup = true
+			}
+			return vector(vecEntry(map[string]string{
+				"service_id": "1314", "service_system_name": "payments", "namespace": "gateways-prod",
+			}, "5000")), http.StatusOK
+		}
+		if strings.Contains(q, "sum by (status)") {
+			return vector(vecEntry(map[string]string{"status": "200"}, "5000")), http.StatusOK
+		}
+		return vector(), http.StatusOK
+	})
+	d := &deps{
+		// The API Manager is in "my-3scale"; the gateway serving this API is not.
+		kc:    &k8sClients{defaultNamespace: "my-3scale"},
+		prom:  newPromClient(f.URL, "", false),
+		admin: newAdminClient(nil, "", "", false, true),
+	}
+	out, err := analyzeAPI(context.Background(), d, analyzeAPIInput{API: "1314", Window: "1h"})
+	if err != nil {
+		t.Fatalf("an API outside THREESCALE_NAMESPACE must still be found: %v", err)
+	}
+	if sawNamespaceFilterDuringLookup {
+		t.Error("the API lookup must not be filtered by namespace")
+	}
+	if !strings.Contains(out, "gateways-prod") {
+		t.Errorf("the report must say where the API is served from:\n%s", out)
+	}
+	if !strings.Contains(out, "1314") {
+		t.Errorf("the API must be identified by its service id:\n%s", out)
+	}
+}
+
+// In the usual topology the APIManager and the gateways are in different
+// namespaces, so naming the APIManager namespace must NOT produce an empty
+// report: the tool reports where the API actually is and says it did so.
+func TestAnalyzeAPIWidensWhenNamespaceExcludesTheAPI(t *testing.T) {
+	f := newFakeProm(t, func(path string, form map[string]string) (any, int) {
+		q := form["query"]
+		if strings.HasPrefix(path, "/api/v1/label/") {
+			return labelValues("upstream_status"), http.StatusOK
+		}
+		if path == "/api/v1/query_range" {
+			return map[string]any{"status": "success", "data": map[string]any{"resultType": "matrix", "result": []any{}}}, http.StatusOK
+		}
+		if strings.Contains(q, "sum by (service_id, service_system_name, namespace)") {
+			return vector(vecEntry(map[string]string{
+				"service_id": "1314", "service_system_name": "payments", "namespace": "gateways-prod",
+			}, "5000")), http.StatusOK
+		}
+		if strings.Contains(q, "sum by (status)") {
+			// Only answered for the gateway namespace: a query still pinned to
+			// my-3scale would come back empty and fail the assertions below.
+			if strings.Contains(q, "gateways-prod") {
+				return vector(vecEntry(map[string]string{"status": "200"}, "5000")), http.StatusOK
+			}
+			return vector(), http.StatusOK
+		}
+		return vector(), http.StatusOK
+	})
+	d := &deps{
+		kc:    &k8sClients{defaultNamespace: "my-3scale"},
+		prom:  newPromClient(f.URL, "", false),
+		admin: newAdminClient(nil, "", "", false, true),
+	}
+	out, err := analyzeAPI(context.Background(), d, analyzeAPIInput{API: "1314", Namespace: "my-3scale", Window: "1h"})
+	if err != nil {
+		t.Fatalf("analyzeAPI: %v", err)
+	}
+	if !strings.Contains(out, "gateways-prod") {
+		t.Errorf("the report must name where the API is served from:\n%s", out)
+	}
+	if !strings.Contains(out, "You asked for namespace") {
+		t.Errorf("overriding the namespace argument must be stated:\n%s", out)
+	}
+	if !strings.Contains(out, "total requests: 5000") {
+		t.Errorf("the report must contain real figures, not zeros:\n%s", out)
 	}
 }
